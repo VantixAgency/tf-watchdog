@@ -1,0 +1,7 @@
+{
+  "name": "tf-watchdog",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "External uptime/pipeline watchdog for the Tattoo Fashion Instagram automation (runs on Vercel, off the n8n server)."
+}

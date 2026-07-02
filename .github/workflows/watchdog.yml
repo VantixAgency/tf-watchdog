@@ -1,0 +1,28 @@
+name: TF Watchdog (15-min ping)
+
+# Externer, häufiger Trigger für den Watchdog — läuft auf GitHub (NICHT auf dem
+# Hetzner-n8n-Server), stößt alle ~15 Min den Vercel-Check an. Der Vercel-Endpoint
+# prüft n8n + Frische und alarmiert per Email/Telegram bei Problemen.
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch: {}
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Watchdog-Check anstoßen
+        run: |
+          set +e
+          resp=$(curl -fsS -m 20 "https://tf-watchdog.vercel.app/api/check?key=${{ secrets.WATCHDOG_KEY }}")
+          code=$?
+          echo "response: $resp"
+          if [ $code -ne 0 ]; then
+            # Fallback: Vercel-Endpoint selbst nicht erreichbar → direkter Alarm,
+            # damit ein Ausfall des Watchdogs nicht auch still bleibt.
+            curl -s -X POST https://api.resend.com/emails \
+              -H "Authorization: Bearer ${{ secrets.RESEND_API_KEY }}" \
+              -H "Content-Type: application/json" \
+              -d "{\"from\":\"TF Watchdog <watchdog@callsam.io>\",\"to\":[\"info@vantixai.de\"],\"subject\":\"🚨 Watchdog-Endpoint nicht erreichbar\",\"text\":\"Der Vercel-Watchdog-Endpoint antwortet nicht (curl exit $code). Bitte tf-watchdog.vercel.app + n8n prüfen.\"}"
+          fi
