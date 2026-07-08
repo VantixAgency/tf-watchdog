@@ -1,28 +1,47 @@
-name: TF Watchdog (15-min ping)
+name: TF Watchdog 5-min ping
 
-# Externer, häufiger Trigger für den Watchdog — läuft auf GitHub (NICHT auf dem
-# Hetzner-n8n-Server), stößt alle ~15 Min den Vercel-Check an. Der Vercel-Endpoint
-# prüft n8n + Frische und alarmiert per Email/Telegram bei Problemen.
+# Echter 5-Minuten-Takt trotz GitHub-Schedule-Drosselung: der Job pingt in einer
+# Schleife alle 5 Min (~5h40m lang) und triggert sich am Ende selbst neu
+# (Self-Chain). Der 6h-Schedule ist nur Sicherheits-Neustart, falls die Kette je
+# abreißt. Läuft extern auf GitHub (nicht auf dem überwachten n8n-Server).
+# Kostenlos, weil das Repo öffentlich ist (unbegrenzte Actions-Minuten).
+
 on:
-  schedule:
-    - cron: "*/15 * * * *"
   workflow_dispatch: {}
+  schedule:
+    - cron: "0 */6 * * *"
+
+permissions:
+  actions: write # für Self-Re-Dispatch via gh
+
+concurrency:
+  group: tf-watchdog-chain
+  cancel-in-progress: false # nie den laufenden Ping-Job abbrechen; max. 1 pending
 
 jobs:
   ping:
     runs-on: ubuntu-latest
+    timeout-minutes: 350 # ~5h50m, dann übernimmt das nächste Kettenglied
     steps:
-      - name: Watchdog-Check anstoßen
+      - name: Alle 5 Minuten den Watchdog anstoßen
+        env:
+          KEY: ${{ secrets.WATCHDOG_KEY }}
         run: |
           set +e
-          resp=$(curl -fsS -m 20 "https://tf-watchdog.vercel.app/api/check?key=${{ secrets.WATCHDOG_KEY }}")
-          code=$?
-          echo "response: $resp"
-          if [ $code -ne 0 ]; then
-            # Fallback: Vercel-Endpoint selbst nicht erreichbar → direkter Alarm,
-            # damit ein Ausfall des Watchdogs nicht auch still bleibt.
-            curl -s -X POST https://api.resend.com/emails \
-              -H "Authorization: Bearer ${{ secrets.RESEND_API_KEY }}" \
-              -H "Content-Type: application/json" \
-              -d "{\"from\":\"TF Watchdog <watchdog@callsam.io>\",\"to\":[\"info@vantixai.de\"],\"subject\":\"🚨 Watchdog-Endpoint nicht erreichbar\",\"text\":\"Der Vercel-Watchdog-Endpoint antwortet nicht (curl exit $code). Bitte tf-watchdog.vercel.app + n8n prüfen.\"}"
-          fi
+          END=$(( $(date +%s) + 20400 ))   # ~5h40m aktiv pingen
+          n=0
+          while [ "$(date +%s)" -lt "$END" ]; do
+            n=$((n+1))
+            resp=$(curl -fsS -m 25 "https://tf-watchdog.vercel.app/api/check?key=${KEY}")
+            if [ $? -ne 0 ]; then
+              echo "$(date -u +%H:%M:%S) ping#$n -> CURL_FAIL (Vercel-Endpoint nicht erreichbar)"
+            else
+              echo "$(date -u +%H:%M:%S) ping#$n -> ${resp:0:140}"
+            fi
+            sleep 300
+          done
+      - name: Kette fortsetzen (Self-Re-Dispatch)
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run watchdog.yml || true
