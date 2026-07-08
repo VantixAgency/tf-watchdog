@@ -103,7 +103,45 @@ async function checkExecutionErrors(n8nUrl) {
   }
 }
 
-// NEU: Der eigentliche Blind-Spot — DMs kommen rein, aber KEINE Antwort geht raus.
+// NEU (Hauptschutz gegen den Incident 2026-06-25): Ingestion tot? DMs kommen auf
+// Instagram an, aber Zernio liefert seit Tagen KEINE Webhooks mehr an n8n → gar keine
+// neue Nachricht landet in der DB. Das erzeugt WEDER Fehler NOCH Executions — nur
+// Stille. Dieser Check misst das Alter der jüngsten eingehenden Nachricht system-
+// weit; ist es > INGEST_STALE_HOURS, ist die Ingestion mit hoher Sicherheit tot.
+// (Genau das lief 2026-06-25 bis 2026-07-08 unbemerkt: 13 Tage, 312h.)
+async function checkIngestion() {
+  const url = process.env.SUPABASE_URL;
+  const key = process.env.SUPABASE_SERVICE_KEY;
+  if (!url || !key) return { skipped: true, reason: "SUPABASE_SERVICE_KEY nicht gesetzt" };
+  const staleH = Number(process.env.INGEST_STALE_HOURS || 12);
+  const base = url.replace(/\/$/, "");
+  const headers = { apikey: key, Authorization: `Bearer ${key}` };
+  try {
+    const res = await withTimeout(
+      (signal) => fetch(
+        `${base}/rest/v1/messages?select=created_at&direction=eq.in&order=created_at.desc&limit=1`,
+        { signal, headers }
+      ), 10000);
+    if (!res.ok) return { skipped: false, ok: true, note: `Ingestion-Check HTTP ${res.status}` };
+    const rows = await res.json();
+    const last = rows?.[0]?.created_at ? new Date(rows[0].created_at) : null;
+    if (!last) return { skipped: false, ok: false, reason: "keine eingehenden Nachrichten in DB" };
+    const ageH = (Date.now() - last.getTime()) / 3.6e6;
+    const dead = ageH > staleH;
+    return {
+      skipped: false,
+      ok: !dead,
+      lastInbound: last.toISOString(),
+      ageHours: Math.round(ageH * 10) / 10,
+      staleThresholdH: staleH,
+      dead,
+    };
+  } catch (e) {
+    return { skipped: false, ok: true, note: "Ingestion-Check fehlgeschlagen: " + String(e).slice(0, 100) };
+  }
+}
+
+// NEU: Der zweite Blind-Spot — DMs kommen rein, aber KEINE Antwort geht raus.
 // Vergleicht jüngste eingehende vs. ausgehende Nachricht. Nur im KI-Fenster gewertet.
 // Bleibt inaktiv, bis SUPABASE_SERVICE_KEY gesetzt ist.
 async function checkReplyGap() {
@@ -181,13 +219,21 @@ export default async function handler(req, res) {
   }
 
   const n8nUrl = process.env.N8N_URL || "https://n8n.dimi-it.com";
-  const [n8n, execErrors, replyGap] = await Promise.all([
+  const [n8n, execErrors, ingestion, replyGap] = await Promise.all([
     checkN8n(n8nUrl),
     checkExecutionErrors(n8nUrl),
+    checkIngestion(),
     checkReplyGap(),
   ]);
 
   const problems = [];
+  // Ingestion zuerst — das ist der gefährlichste, weil komplett stille Ausfall.
+  if (ingestion.dead) {
+    problems.push(`INGESTION TOT: seit ${ingestion.ageHours}h keine eingehende DM in der DB (letzte ${ingestion.lastInbound}). Zernio→n8n liefert nicht — Instagram-DMs werden NICHT verarbeitet.`);
+  }
+  if (ingestion.reason === "keine eingehenden Nachrichten in DB") {
+    problems.push("INGESTION: keine eingehenden Nachrichten in der DB gefunden — Pipeline prüfen.");
+  }
   if (!n8n.ok) {
     problems.push(`n8n NICHT erreichbar (${n8nUrl}) — Status ${n8n.status}${n8n.error ? " / " + n8n.error : ""}`);
   }
@@ -211,8 +257,9 @@ export default async function handler(req, res) {
       ...problems.map((p) => "• " + p),
       "",
       `Zeit: ${new Date().toISOString()}`,
-      "Checks: n8n-Erreichbarkeit + Workflow-Fehler (Executions-API) + Reply-Gap.",
-      "→ n8n öffnen (Executions), betroffenen Workflow prüfen; oft Supabase-Erreichbarkeit.",
+      "Checks: Ingestion-Frische + n8n-Erreichbarkeit + Workflow-Fehler (Executions-API) + Reply-Gap.",
+      "→ Bei INGESTION TOT: Zernio-Verbindung prüfen (Webhook /zernio-ig kommt nicht an).",
+      "→ Sonst: n8n öffnen (Executions), betroffenen Workflow prüfen; oft Supabase-Erreichbarkeit.",
     ].join("\n");
     const [email, tg] = await Promise.all([sendEmail(subject, body), sendTelegram(subject + "\n\n" + body)]);
     alerted = { email, telegram: tg };
@@ -222,6 +269,7 @@ export default async function handler(req, res) {
     checkedAt: new Date().toISOString(),
     n8n,
     executionErrors: execErrors,
+    ingestion,
     replyGap,
     problems,
     healthy: problems.length === 0,
