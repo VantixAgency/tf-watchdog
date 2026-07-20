@@ -23,21 +23,35 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 350 # ~5h50m, dann übernimmt das nächste Kettenglied
     steps:
-      - name: Alle 5 Minuten den Watchdog anstoßen
+      - name: Alle 5 Minuten den Watchdog anstoßen (mit Alarm-Entprellung)
         env:
           KEY: ${{ secrets.WATCHDOG_KEY }}
         run: |
           set +e
+          BASE="https://tf-watchdog.vercel.app/api/check"
           END=$(( $(date +%s) + 20400 ))   # ~5h40m aktiv pingen
+          # Zustandsgedächtnis: verhindert die 10-Mail-Flut. Der Endpoint mailt nur,
+          # wenn sich das Problem ÄNDERT, alle 2h erneut (Erinnerung), oder bei Entwarnung.
+          prev="OK"        # zuletzt gesehener Fingerprint (Startannahme: gesund)
+          last_alert=0     # Unix-ts der letzten wirklich gesendeten Alarm-Mail
           n=0
           while [ "$(date +%s)" -lt "$END" ]; do
             n=$((n+1))
-            resp=$(curl -fsS -m 25 "https://tf-watchdog.vercel.app/api/check?key=${KEY}")
-            if [ $? -ne 0 ]; then
+            now=$(date +%s)
+            sinceAlert=$(( now - last_alert ))
+            resp=$(curl -fsS -m 25 --get "$BASE" \
+              --data-urlencode "key=${KEY}" \
+              --data-urlencode "prev=${prev}" \
+              --data-urlencode "sinceAlert=${sinceAlert}")
+            if [ $? -ne 0 ] || [ -z "$resp" ]; then
               echo "$(date -u +%H:%M:%S) ping#$n -> CURL_FAIL (Vercel-Endpoint nicht erreichbar)"
-            else
-              echo "$(date -u +%H:%M:%S) ping#$n -> ${resp:0:140}"
+              sleep 300; continue
             fi
+            fp=$(printf '%s' "$resp" | jq -r '.fp // "OK"')
+            didAlert=$(printf '%s' "$resp" | jq -r '(.alerted.problem // false)')
+            [ "$didAlert" = "true" ] && last_alert=$now
+            echo "$(date -u +%H:%M:%S) ping#$n -> fp=${fp} alert=${didAlert}"
+            prev="$fp"
             sleep 300
           done
       - name: Kette fortsetzen (Self-Re-Dispatch)

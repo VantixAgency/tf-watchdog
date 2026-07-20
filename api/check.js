@@ -141,9 +141,21 @@ async function checkIngestion() {
   }
 }
 
-// NEU: Der zweite Blind-Spot — DMs kommen rein, aber KEINE Antwort geht raus.
-// Vergleicht jüngste eingehende vs. ausgehende Nachricht. Nur im KI-Fenster gewertet.
+// Der zweite Blind-Spot — DMs kommen rein, aber KEINE Antwort geht raus.
 // Bleibt inaktiv, bis SUPABASE_SERVICE_KEY gesetzt ist.
+//
+// WICHTIG (Fix 2026-07-20): früher verglich dieser Check nur GLOBAL "jüngster
+// Eingang" vs. "jüngste Antwort". Das erzeugte Dauer-Fehlalarme, sobald ein Chat
+// im Mensch-Takeover ist (ai_paused=true, "Direkt in Instagram beantwortet"):
+// die KI SOLL dort schweigen, der Kunde schreibt aber nach → global sah es aus
+// wie "KI antwortet nicht". Promises Postfach lief damit voll.
+// Neu: pro Chat, und NUR Chats zählen, in denen die KI tatsächlich zuständig ist:
+//   - ai_enabled=true UND ai_paused=false   (kein Takeover, keine Pause)
+//   - Account ki_global_on=true             (KI global an)
+//   - letzter Eingang älter als gapMin      (KI hätte längst antworten müssen)
+//   - danach kam WEDER Antwort NOCH KI-Lauf (last_outbound_at/last_ai_run_at < Eingang)
+// So bleiben übernommene/pausierte Chats außen vor; gemeldet wird nur, wenn die
+// KI wirklich zuständig ist und trotzdem hängt.
 async function checkReplyGap() {
   const url = process.env.SUPABASE_URL;
   const key = process.env.SUPABASE_SERVICE_KEY;
@@ -151,34 +163,81 @@ async function checkReplyGap() {
   const gapMin = Number(process.env.REPLY_GAP_MIN || 25);
   const base = url.replace(/\/$/, "");
   const headers = { apikey: key, Authorization: `Bearer ${key}` };
-  const latest = async (dir) => {
-    const res = await withTimeout(
-      (signal) => fetch(
-        `${base}/rest/v1/messages?select=created_at&direction=eq.${dir}&order=created_at.desc&limit=1`,
-        { signal, headers }
-      ), 10000);
-    const rows = await res.json();
-    return rows?.[0]?.created_at ? new Date(rows[0].created_at) : null;
-  };
+  const cutoff = new Date(Date.now() - gapMin * 60000).toISOString();
   try {
-    const [lastIn, lastOut] = await Promise.all([latest("in"), latest("out")]);
-    if (!lastIn) return { skipped: false, ok: true, note: "keine eingehenden Nachrichten" };
-    const inAgeMin = (Date.now() - lastIn.getTime()) / 60000;
-    const outAgeMin = lastOut ? (Date.now() - lastOut.getTime()) / 60000 : Infinity;
-    // Verdächtig: der letzte Eingang liegt > gapMin ohne dass danach eine Antwort kam,
-    // und wir sind im KI-Fenster. (Frischer Eingang < gapMin = KI darf noch arbeiten.)
-    const stalledReply = inAgeMin >= gapMin && outAgeMin > inAgeMin && inActiveWindow();
+    // Kandidaten: KI zuständig + Eingang alt genug. Spalten-zu-Spalten-Vergleich
+    // (Antwort älter als Eingang) macht PostgREST nicht → in JS nachfiltern.
+    const q =
+      `${base}/rest/v1/chats?select=id,last_inbound_at,last_outbound_at,last_ai_run_at,accounts!inner(slug,ki_global_on)` +
+      `&ai_enabled=eq.true&ai_paused=eq.false&accounts.ki_global_on=eq.true` +
+      `&last_inbound_at=not.is.null&last_inbound_at=lt.${cutoff}` +
+      `&order=last_inbound_at.desc&limit=300`;
+    const res = await withTimeout((signal) => fetch(q, { signal, headers }), 10000);
+    if (!res.ok) return { skipped: false, ok: true, note: `Reply-Gap-Check HTTP ${res.status}` };
+    const rows = await res.json();
+    const now = Date.now();
+    const stuck = (Array.isArray(rows) ? rows : [])
+      .filter((c) => {
+        const inT = new Date(c.last_inbound_at).getTime();
+        const outT = c.last_outbound_at ? new Date(c.last_outbound_at).getTime() : 0;
+        const runT = c.last_ai_run_at ? new Date(c.last_ai_run_at).getTime() : 0;
+        // Weder Antwort noch KI-Lauf NACH dem Eingang → Chat hängt wirklich.
+        return outT < inT && runT < inT;
+      })
+      .map((c) => ({
+        chat: c.id,
+        account: c.accounts?.slug || "?",
+        inboundAgeMin: Math.round((now - new Date(c.last_inbound_at).getTime()) / 60000),
+      }));
+    // Nur im KI-Aktivfenster als Problem werten (Mo-Fr tagsüber antwortet das Studio manuell).
+    const stalledReply = stuck.length > 0 && inActiveWindow();
     return {
       skipped: false,
       ok: !stalledReply,
-      lastInbound: lastIn.toISOString(),
-      lastOutbound: lastOut ? lastOut.toISOString() : null,
-      inboundAgeMin: Math.round(inAgeMin),
+      gapMin,
+      inActiveWindow: inActiveWindow(),
+      stuckCount: stuck.length,
+      stuckChats: stuck.slice(0, 10),
       stalledReply,
     };
   } catch (e) {
     return { skipped: false, ok: true, note: "Reply-Gap-Check fehlgeschlagen: " + String(e).slice(0, 100) };
   }
+}
+
+// ---- Alarm-Entprellung (Anti-Spam) -----------------------------------------
+// Problem: früher mailte JEDER Check, der ein Problem sah. Ein Reply-Gap, der
+// 100 Min anhält, erzeugte bei 5-Min-Takt ~20 identische Mails (Incident
+// 2026-07-11: ~10 Mails für EINEN steckengebliebenen DM). Fix: Der Aufrufer
+// (GitHub-Action) merkt sich den letzten Zustand und übergibt ihn als ?prev=…
+// & ?sinceAlert=…; diese reine Funktion entscheidet dann, ob wirklich gemailt
+// wird — nur bei NEUEM Problem, nach Ablauf des Remind-Intervalls, oder bei
+// Entwarnung.
+
+// Stabiler Fingerprint NUR aus Zustands-Flags — bewusst OHNE Minutenzahlen,
+// damit er sich nicht bei jedem Ping ändert, solange dasselbe Problem anhält.
+export function computeFingerprint({ ingestion, n8n, execErrors, replyGap }, hasProblems) {
+  if (!hasProblems) return "OK";
+  const offenders = (execErrors?.offenders || []).map((o) => o.workflowId).sort().join(",");
+  return [
+    `ing:${!!ingestion?.dead || ingestion?.reason === "keine eingehenden Nachrichten in DB"}`,
+    `n8n:${!n8n?.ok}`,
+    `exec:${offenders}`,
+    `reply:${!!replyGap?.stalledReply}`,
+  ].join("|");
+}
+
+// Entscheidet, welche Aktion der Handler ausführt: neues/erneuertes Problem
+// mailen, Entwarnung mailen, oder still bleiben.
+export function decideAlert({ hasProblems, fp, prev, sinceAlert, remind, notifyOff }) {
+  if (notifyOff) return "none";               // Hard-Mute (stiller Status-Ping)
+  if (hasProblems) {
+    const isNew = fp !== prev;                // Problemtyp hat sich geändert
+    const remindDue = sinceAlert >= remind;   // dasselbe Problem lange offen → Erinnerung
+    return isNew || remindDue ? "problem" : "none";
+  }
+  // Keine Probleme: nur mailen, wenn davor ein echtes Problem lief (Entwarnung).
+  return prev && prev !== "OK" ? "resolved" : "none";
 }
 
 async function sendEmail(subject, text) {
@@ -243,13 +302,33 @@ export default async function handler(req, res) {
     }
   }
   if (replyGap.stalledReply) {
-    problems.push(`Eingang seit ${replyGap.inboundAgeMin} Min ohne Antwort (letzte Antwort ${replyGap.lastOutbound || "nie"}) — KI empfängt, antwortet aber nicht`);
+    const detail = (replyGap.stuckChats || [])
+      .map((c) => `${c.account}/${String(c.chat).slice(0, 8)} (${c.inboundAgeMin} Min)`)
+      .join(", ");
+    problems.push(
+      `${replyGap.stuckCount} Chat(s) warten > ${replyGap.gapMin} Min auf KI-Antwort, obwohl die KI zuständig ist (nicht pausiert/übernommen): ${detail} — KI empfängt, antwortet aber nicht`
+    );
   }
   // Test-Trigger: ?simulate=down erzwingt einen Alarm (Alarm-Weg-Test).
   if (req.query?.simulate === "down") problems.push("TEST-ALARM (simulate=down) — kein echtes Problem, nur Alarm-Weg-Test.");
 
+  // Alarm-Entprellung: Zustand kommt vom Aufrufer (GitHub-Action) via Query.
+  const fp = computeFingerprint({ ingestion, n8n, execErrors, replyGap }, problems.length > 0);
+  const prev = typeof req.query?.prev === "string" ? req.query.prev : null;
+  const sinceAlert = Number(req.query?.sinceAlert);
+  const remind = Number(req.query?.remind || process.env.REMIND_SEC || 7200); // 2h Default
+  const notifyOff = req.query?.notify === "0";
+  const action = decideAlert({
+    hasProblems: problems.length > 0,
+    fp,
+    prev,
+    sinceAlert: Number.isFinite(sinceAlert) ? sinceAlert : Infinity,
+    remind,
+    notifyOff,
+  });
+
   let alerted = null;
-  if (problems.length) {
+  if (action === "problem") {
     const subject = "🚨 Tattoo Fashion Automation: PROBLEM";
     const body = [
       "Der Watchdog hat ein Problem erkannt:",
@@ -260,9 +339,25 @@ export default async function handler(req, res) {
       "Checks: Ingestion-Frische + n8n-Erreichbarkeit + Workflow-Fehler (Executions-API) + Reply-Gap.",
       "→ Bei INGESTION TOT: Zernio-Verbindung prüfen (Webhook /zernio-ig kommt nicht an).",
       "→ Sonst: n8n öffnen (Executions), betroffenen Workflow prüfen; oft Supabase-Erreichbarkeit.",
+      "",
+      "(Diese Meldung wiederholt sich frühestens in 2h, solange dasselbe Problem anhält.)",
     ].join("\n");
     const [email, tg] = await Promise.all([sendEmail(subject, body), sendTelegram(subject + "\n\n" + body)]);
-    alerted = { email, telegram: tg };
+    alerted = { problem: true, email, telegram: tg };
+  } else if (action === "resolved") {
+    const subject = "✅ Tattoo Fashion Automation: wieder OK";
+    const body = [
+      "Entwarnung — die Automation läuft wieder normal.",
+      "",
+      `Letzter Eingang: ${ingestion.lastInbound || "?"}`,
+      `Offene KI-Chats: ${replyGap.stuckCount ?? 0}`,
+      "",
+      `Zeit: ${new Date().toISOString()}`,
+    ].join("\n");
+    const [email, tg] = await Promise.all([sendEmail(subject, body), sendTelegram(subject + "\n\n" + body)]);
+    alerted = { resolved: true, email, telegram: tg };
+  } else if (notifyOff) {
+    alerted = { suppressed: true };
   }
 
   return res.status(200).json({
@@ -272,6 +367,7 @@ export default async function handler(req, res) {
     ingestion,
     replyGap,
     problems,
+    fp,
     healthy: problems.length === 0,
     alerted,
   });
