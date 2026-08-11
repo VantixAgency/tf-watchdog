@@ -55,14 +55,48 @@ async function checkN8n(url) {
   }
 }
 
-// KI-Aktivfenster (Europe/Berlin): Mo-Fr 18-10 + Sa/So ganztägig. Nur dann ist
-// "keine Antwort" verdächtig (tagsüber Mo-Fr antwortet eh das Studio manuell).
-function inActiveWindow(now = new Date()) {
-  const berlin = new Date(now.toLocaleString("en-US", { timeZone: "Europe/Berlin" }));
-  const dow = berlin.getDay(); // 0=So, 6=Sa
-  if (dow === 0 || dow === 6) return true;
-  const h = berlin.getHours();
-  return h >= 18 || h < 10;
+// KI-Antwortfenster — WOHER es kommt, ist der Punkt (Fix 2026-08-11):
+// Vorher stand hier "Mo-Fr 18-10 + Sa/So" FEST IM CODE, mit der Begründung
+// "tagsüber antwortet eh das Studio manuell". Damit war der Watchdog Mo-Fr
+// zwischen 10 und 18 Uhr blind: hängende Chats wurden schlicht nicht gemeldet.
+// In Wahrheit steht das Fenster pro Studio in der DB (ki_active_hours_start/
+// _end/_weekend, im Dashboard einstellbar) — der n8n-Reply-Runner liest genau
+// diese Spalten. Der Monitor liest sie jetzt auch, statt sie zu raten: stellt
+// das Studio auf 24/7, überwacht der Watchdog automatisch 24/7 mit.
+const BERLIN_CLOCK = new Intl.DateTimeFormat("en-GB", {
+  timeZone: "Europe/Berlin",
+  weekday: "short",
+  hour: "2-digit",
+  minute: "2-digit",
+  hourCycle: "h23",
+});
+
+const toMinutes = (hhmm) => {
+  const [h, m] = String(hhmm).split(":");
+  return Number(h) * 60 + Number(m || 0);
+};
+
+export function kiWindowActive(account = {}, nowMs = Date.now()) {
+  const start = account.ki_active_hours_start;
+  const end = account.ki_active_hours_end;
+  // Nicht konfiguriert oder Start==Ende → rund um die Uhr. Bewusst so: eine leere
+  // Spalte darf kein stilles Blindloch erzeugen, sie muss zu MEHR Beobachtung führen.
+  if (!start || !end || start === end) return true;
+
+  const parts = Object.fromEntries(
+    BERLIN_CLOCK.formatToParts(new Date(nowMs)).map((p) => [p.type, p.value])
+  );
+  if (parts.weekday === "Sat" || parts.weekday === "Sun") {
+    // Wochenend-Semantik exakt wie im n8n-Reply-Runner: nur true heißt aktiv.
+    return account.ki_active_weekend === true;
+  }
+  const s = toMinutes(start);
+  const e = toMinutes(end);
+  // Ein Fenster, das praktisch den ganzen Tag abdeckt, IST 24/7. TF steht real auf
+  // "00:00:00-23:59:59" — naiv gerechnet wäre 23:59 Uhr eine blinde Minute pro Tag.
+  if (e - s >= 1439) return true;
+  const now = (Number(parts.hour) % 24) * 60 + Number(parts.minute);
+  return s <= e ? now >= s && now < e : now >= s || now < e;
 }
 
 // NEU: Fragt die n8n-Executions-API und zählt Fehler der kritischen Workflows im
@@ -238,7 +272,8 @@ async function checkReplyGap() {
     // Kandidaten: KI zuständig + Eingang alt genug. Spalten-zu-Spalten-Vergleich
     // (Antwort älter als Eingang) macht PostgREST nicht → in JS nachfiltern.
     const q =
-      `${base}/rest/v1/chats?select=id,last_inbound_at,last_outbound_at,last_ai_run_at,accounts!inner(slug,ki_global_on)` +
+      `${base}/rest/v1/chats?select=id,last_inbound_at,last_outbound_at,last_ai_run_at,` +
+      `accounts!inner(slug,ki_global_on,ki_active_hours_start,ki_active_hours_end,ki_active_weekend)` +
       `&ai_enabled=eq.true&ai_paused=eq.false&accounts.ki_global_on=eq.true` +
       `&last_inbound_at=not.is.null&last_inbound_at=lt.${cutoff}` +
       `&order=last_inbound_at.desc&limit=300`;
@@ -246,28 +281,43 @@ async function checkReplyGap() {
     if (!res.ok) return { skipped: false, ok: true, note: `Reply-Gap-Check HTTP ${res.status}` };
     const rows = await res.json();
     const now = Date.now();
-    const stuck = (Array.isArray(rows) ? rows : [])
-      .filter((c) => {
-        const inT = new Date(c.last_inbound_at).getTime();
-        const outT = c.last_outbound_at ? new Date(c.last_outbound_at).getTime() : 0;
-        const runT = c.last_ai_run_at ? new Date(c.last_ai_run_at).getTime() : 0;
-        // Weder Antwort noch KI-Lauf NACH dem Eingang → Chat hängt wirklich.
-        return outT < inT && runT < inT;
-      })
+    const hanging = (Array.isArray(rows) ? rows : []).filter((c) => {
+      const inT = new Date(c.last_inbound_at).getTime();
+      const outT = c.last_outbound_at ? new Date(c.last_outbound_at).getTime() : 0;
+      const runT = c.last_ai_run_at ? new Date(c.last_ai_run_at).getTime() : 0;
+      // Weder Antwort noch KI-Lauf NACH dem Eingang → Chat hängt wirklich.
+      return outT < inT && runT < inT;
+    });
+    // Gemeldet wird nur, was in das Antwortfenster DES JEWEILIGEN Studios fällt —
+    // aus der DB gelesen, nicht geraten. Steht das Studio auf 24/7, ist immer Fenster.
+    const stuck = hanging
+      .filter((c) => kiWindowActive(c.accounts || {}, now))
       .map((c) => ({
         chat: c.id,
         account: c.accounts?.slug || "?",
         inboundAgeMin: Math.round((now - new Date(c.last_inbound_at).getTime()) / 60000),
       }));
-    // Nur im KI-Aktivfenster als Problem werten (Mo-Fr tagsüber antwortet das Studio manuell).
-    const stalledReply = stuck.length > 0 && inActiveWindow();
+    // Was außerhalb des Fensters hängt, ist kein Alarm, aber sichtbar: daran sieht
+    // man, ob das konfigurierte Fenster zur Wirklichkeit passt.
+    const outsideWindow = hanging.length - stuck.length;
+    // Welche Fenster tatsächlich in der DB stehen — pro Studio, zum Nachschauen.
+    const windows = {};
+    for (const c of Array.isArray(rows) ? rows : []) {
+      const a = c.accounts || {};
+      if (!a.slug || windows[a.slug]) continue;
+      windows[a.slug] = a.ki_active_hours_start && a.ki_active_hours_end
+        ? `${a.ki_active_hours_start}-${a.ki_active_hours_end}${a.ki_active_weekend === true ? " +Sa/So" : " ohne Sa/So"}`
+        : "24/7 (nicht konfiguriert)";
+    }
+    const stalledReply = stuck.length > 0;
     return {
       skipped: false,
       ok: !stalledReply,
       gapMin,
-      inActiveWindow: inActiveWindow(),
+      windows,
       stuckCount: stuck.length,
       stuckChats: stuck.slice(0, 10),
+      outsideWindow,
       stalledReply,
     };
   } catch (e) {
