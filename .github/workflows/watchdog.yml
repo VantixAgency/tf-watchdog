@@ -33,6 +33,7 @@ jobs:
           # Zustandsgedächtnis: verhindert die 10-Mail-Flut. Der Endpoint mailt nur,
           # wenn sich das Problem ÄNDERT, alle 2h erneut (Erinnerung), oder bei Entwarnung.
           prev="OK"        # zuletzt gesehener Fingerprint (Startannahme: gesund)
+          alerted_fp="OK"  # Fingerprint, über den zuletzt WIRKLICH gemailt wurde
           last_alert=0     # Unix-ts der letzten wirklich gesendeten Alarm-Mail
           n=0
           while [ "$(date +%s)" -lt "$END" ]; do
@@ -42,6 +43,7 @@ jobs:
             resp=$(curl -fsS -m 25 --get "$BASE" \
               --data-urlencode "key=${KEY}" \
               --data-urlencode "prev=${prev}" \
+              --data-urlencode "alertedFp=${alerted_fp}" \
               --data-urlencode "sinceAlert=${sinceAlert}")
             if [ $? -ne 0 ] || [ -z "$resp" ]; then
               echo "$(date -u +%H:%M:%S) ping#$n -> CURL_FAIL (Vercel-Endpoint nicht erreichbar)"
@@ -49,8 +51,12 @@ jobs:
             fi
             fp=$(printf '%s' "$resp" | jq -r '.fp // "OK"')
             didAlert=$(printf '%s' "$resp" | jq -r '(.alerted.problem // false)')
-            [ "$didAlert" = "true" ] && last_alert=$now
-            echo "$(date -u +%H:%M:%S) ping#$n -> fp=${fp} alert=${didAlert}"
+            didResolve=$(printf '%s' "$resp" | jq -r '(.alerted.resolved // false)')
+            # Gedächtnis, worüber wirklich gemailt wurde. Ohne das käme entweder eine
+            # Mail-Flut oder eine Entwarnung für ein nie gemeldetes Problem.
+            if [ "$didAlert" = "true" ]; then last_alert=$now; alerted_fp="$fp"; fi
+            [ "$didResolve" = "true" ] && alerted_fp="OK"
+            echo "$(date -u +%H:%M:%S) ping#$n -> fp=${fp} alert=${didAlert} gemeldet=${alerted_fp}"
             prev="$fp"
             sleep 300
           done

@@ -27,9 +27,11 @@
 //   SUPABASE_URL            optional (Reply-Gap-Check)
 //   SUPABASE_SERVICE_KEY    optional (Service-Role, für RLS-freien Read)
 //   REPLY_GAP_MIN           optional, Default 25 (Min. ohne Antwort trotz Eingang)
-//   INGEST_ACTIVE_STALE_H   optional, Default 12 (Aktivstunden Stille = Ingestion tot)
-//   INGEST_HARD_STALE_H     optional, Default 48 (Wanduhr-Reißleine, fensterunabhängig)
-//   INGEST_ACTIVE_FROM/_TO  optional, Default 9/23 (Aktivfenster, Stunden Europe/Berlin)
+//   REPLY_STUCK_COUNT       optional, Default 2  (ab so vielen hängenden Chats = Stau)
+//   REPLY_GAP_HARD_MIN      optional, Default 60 (ein Chat so lange = liegen geblieben)
+//   INGEST_HARD_STALE_H     optional, Default 36 (Reißleine; schnell meldet Zernio)
+//   ZERNIO_API_KEY          Zernio-Webhook-Status (der eigentliche Ingestion-Melder)
+//   ZERNIO_WEBHOOK_MATCH    optional, Default "tattoo-fashion-zernio-ingest"
 //
 // Kritische Workflows (n8n-IDs → Klartext). Erroren die, ist die KI beeinträchtigt.
 const CRITICAL_WORKFLOWS = {
@@ -140,80 +142,30 @@ async function checkExecutionErrors(n8nUrl) {
   }
 }
 
-// NEU (Hauptschutz gegen den Incident 2026-06-25): Ingestion tot? DMs kommen auf
-// Instagram an, aber Zernio liefert seit Tagen KEINE Webhooks mehr an n8n → gar keine
-// neue Nachricht landet in der DB. Das erzeugt WEDER Fehler NOCH Executions — nur
-// Stille. Dieser Check misst das Alter der jüngsten eingehenden Nachricht system-
-// weit; ist es > INGEST_STALE_HOURS, ist die Ingestion mit hoher Sicherheit tot.
-// (Genau das lief 2026-06-25 bis 2026-07-08 unbemerkt: 13 Tage, 312h.)
+// LETZTE REISSLEINE (Rückbau 11.08.2026). Ursprünglich war dies der Hauptschutz
+// gegen den stillen 13-Tage-Ausfall vom Juni: Zernio lieferte keine Webhooks mehr,
+// es gab weder Fehler noch Executions — nur Stille. Der Check erschloss das aus dem
+// Alter der jüngsten eingehenden Nachricht.
 //
-// FEHLALARM-FIX 2026-08-11: Gemessen wurde ursprünglich reine WANDUHR-Zeit. Die
-// läuft aber nachts weiter, wo naturgemäß niemand schreibt — der Check konnte
-// "gerade schreibt keiner" nicht von "Pipeline tot" unterscheiden und meldete nach
-// ruhigen Nächten Ausfälle (belegt 07.08. 10:46 nach 13,6h Lücke und 08.08. 05:29
-// nach 16,3h; beide gingen von selbst weg, sobald die erste DM des Tages kam).
-// Das ist gefährlicher als es klingt: Dieser Check ist das Netz gegen den stillen
-// 13-Tage-Ausfall vom Juni — ein Melder, dem man nicht mehr glaubt, ist keiner.
-// Neu zählen nur Stunden, in denen überhaupt DMs eintrudeln (Fenster 09-23 Berlin),
-// plus eine 48h-Wanduhr-Reißleine, falls die Fenster-Annahme mal nicht mehr stimmt.
-const BERLIN_HOUR = new Intl.DateTimeFormat("en-GB", {
-  timeZone: "Europe/Berlin",
-  hour: "2-digit",
-  hourCycle: "h23",
-});
-
-// Stunden zwischen zwei Zeitpunkten, die ins tägliche Aktivfenster fallen.
-// Schrittweise gezählt statt per Datumsarithmetik — so ist die Sommer-/Winterzeit-
-// Umstellung automatisch korrekt, weil die Berliner Stunde je Schritt direkt aus
-// der Zeitzonen-Datenbank kommt.
-export function activeHoursBetween(fromMs, toMs, opts = {}) {
-  const { fromHour = 9, toHour = 23, stepMin = 15, capH = 72 } = opts;
-  if (!(toMs > fromMs)) return 0;
-  const stepMs = stepMin * 60000;
-  const start = Math.max(fromMs, toMs - capH * 3.6e6);
-  let active = 0;
-  for (let t = start; t < toMs; t += stepMs) {
-    // Letzter Schritt wird angeschnitten, sonst zählte eine Zwei-Minuten-Lücke
-    // als volle Viertelstunde.
-    const span = Math.min(stepMs, toMs - t);
-    const h = Number(BERLIN_HOUR.format(new Date(t + span / 2))) % 24;
-    if (h >= fromHour && h < toHour) active += span / 3.6e6;
-  }
-  return Math.round(active * 100) / 100;
-}
-
-// Bewertet die Stille rein rechnerisch (keine Netz-Zugriffe) — dadurch gegen die
-// beiden echten Fehlalarme testbar, siehe test/ingestion.test.js.
+// Ein Rückschluss aus Stille braucht aber Annahmen darüber, wann Kunden schreiben
+// (erst 12h Wanduhr → Fehlalarme nach ruhigen Nächten, dann Aktivstunden 09-23 →
+// eine Annahme, die mangels DB-Zugang nie überprüft werden konnte). Seit checkZernio()
+// den Webhook-Status DIREKT abfragt, ist dieser Umweg überflüssig: Zernio meldet
+// denselben Ausfall in 5 Minuten statt in Stunden, deterministisch und ohne Uhr.
+//
+// Geblieben ist eine grobe Reißleine für den Restfall "Zernio meldet sich gesund,
+// es kommt trotzdem nichts an". 36h liegt weit über der längsten je beobachteten
+// natürlichen Lücke (16,3h) und halbiert die blinde Zeit, falls der Zernio-Check
+// mal ausfällt (er hängt an einem geborgten API-Key).
 export function ingestionVerdict(lastMs, nowMs, opts = {}) {
-  const activeThresholdH = Number(opts.activeThresholdH ?? process.env.INGEST_ACTIVE_STALE_H ?? 12);
-  const hardThresholdH = Number(opts.hardThresholdH ?? process.env.INGEST_HARD_STALE_H ?? 48);
-  const fromHour = Number(opts.fromHour ?? process.env.INGEST_ACTIVE_FROM ?? 9);
-  const toHour = Number(opts.toHour ?? process.env.INGEST_ACTIVE_TO ?? 23);
-
+  const staleH = Number(opts.staleH ?? process.env.INGEST_HARD_STALE_H ?? 36);
   const ageHours = Math.round(((nowMs - lastMs) / 3.6e6) * 10) / 10;
-  const activeHours = activeHoursBetween(lastMs, nowMs, {
-    fromHour,
-    toHour,
-    capH: hardThresholdH + 24,
-  });
-
-  // Reißleine zuerst: bei langen Ausfällen ist die Wanduhr-Zahl die ehrlichere
-  // Aussage — die Aktivstunden sind dann durch den Scan-Deckel gekappt.
-  let reason = null;
-  if (ageHours > hardThresholdH) {
-    reason = `${ageHours}h Wanduhr ohne DM (Reißleine ${hardThresholdH}h)`;
-  } else if (activeHours > activeThresholdH) {
-    reason = `${activeHours} Aktivstunden ohne DM (Schwelle ${activeThresholdH}, Fenster ${fromHour}-${toHour} Uhr)`;
-  }
-
+  const dead = ageHours > staleH;
   return {
     ageHours,
-    activeHours,
-    activeWindow: `${fromHour}-${toHour}`,
-    activeThresholdH,
-    hardThresholdH,
-    dead: reason !== null,
-    reason,
+    staleThresholdH: staleH,
+    dead,
+    reason: dead ? `${ageHours}h ohne eingehende DM (Schwelle ${staleH}h)` : null,
   };
 }
 
@@ -332,6 +284,27 @@ async function checkZernio() {
 //   - danach kam WEDER Antwort NOCH KI-Lauf (last_outbound_at/last_ai_run_at < Eingang)
 // So bleiben übernommene/pausierte Chats außen vor; gemeldet wird nur, wenn die
 // KI wirklich zuständig ist und trotzdem hängt.
+// FLUGHÖHE (Fix 11.08.2026): Nachdem das Werktags-Blindloch zu war, meldete der
+// Watchdog sofort einen EINZELNEN Chat, der 25 Min wartete. Das ist die falsche
+// Flughöhe für einen externen Monitor — Einzelfälle deckt der interne n8n-Monitor
+// ab (ab 7 Min) und das Dashboard. Dazu kommt: Übernimmt das Studio einen Chat von
+// Hand, wird das erst erkannt, wenn der Mensch antwortet; bis dahin sieht der Chat
+// aus wie "hängt". Gemeldet wird deshalb der STAU (mehrere gleichzeitig) oder der
+// echte Liegenbleiber (einer über einer Stunde). Bewusst ohne Uhrzeit-Annahme, sonst
+// wäre es derselbe Fehler wie das alte fest einkompilierte Fenster.
+export function replyGapVerdict(stuck = [], opts = {}) {
+  const minCount = Number(opts.minCount ?? process.env.REPLY_STUCK_COUNT ?? 2);
+  const hardMin = Number(opts.hardMin ?? process.env.REPLY_GAP_HARD_MIN ?? 60);
+  const oldestStuckMin = stuck.reduce((max, c) => Math.max(max, Number(c?.inboundAgeMin) || 0), 0);
+  return {
+    stuckCount: stuck.length,
+    oldestStuckMin,
+    stalledReply: stuck.length >= minCount || oldestStuckMin >= hardMin,
+    minCount,
+    hardMin,
+  };
+}
+
 async function checkReplyGap() {
   const url = process.env.SUPABASE_URL;
   const key = process.env.SUPABASE_SERVICE_KEY;
@@ -381,16 +354,15 @@ async function checkReplyGap() {
         ? `${a.ki_active_hours_start}-${a.ki_active_hours_end}${a.ki_active_weekend === true ? " +Sa/So" : " ohne Sa/So"}`
         : "24/7 (nicht konfiguriert)";
     }
-    const stalledReply = stuck.length > 0;
+    const verdict = replyGapVerdict(stuck);
     return {
       skipped: false,
-      ok: !stalledReply,
+      ok: !verdict.stalledReply,
       gapMin,
       windows,
-      stuckCount: stuck.length,
       stuckChats: stuck.slice(0, 10),
       outsideWindow,
-      stalledReply,
+      ...verdict,
     };
   } catch (e) {
     return { skipped: false, ok: true, note: "Reply-Gap-Check fehlgeschlagen: " + String(e).slice(0, 100) };
@@ -424,15 +396,50 @@ export function computeFingerprint({ ingestion, n8n, execErrors, replyGap, zerni
 
 // Entscheidet, welche Aktion der Handler ausführt: neues/erneuertes Problem
 // mailen, Entwarnung mailen, oder still bleiben.
-export function decideAlert({ hasProblems, fp, prev, sinceAlert, remind, notifyOff }) {
+// PERSISTENZ (11.08.2026): Früher mailte der erste Ping, der ein Problem sah. Alles
+// Flüchtige landete damit sofort im Postfach und war beim Lesen längst vorbei — ein
+// n8n-Aussetzer, ein Wackler beim Deploy, ein Chat, der gerade beantwortet wird.
+// Ein Problem muss jetzt ZWEIMAL hintereinander auftauchen (5 Min Abstand), bevor
+// gemailt wird. Kostet 5 Minuten Meldeverzug, spart den Großteil der Fehlalarme.
+//
+// `alertedFp` = der Fingerprint, über den zuletzt WIRKLICH gemailt wurde. Vorher hing
+// die Entwarnung an `prev` (zuletzt gesehener Zustand) — dadurch kam eine "wieder OK"-
+// Mail auch für Probleme, von denen der Empfänger nie erfahren hatte.
+export function decideAlert({ hasProblems, fp, prev, alertedFp, sinceAlert, remind, notifyOff }) {
   if (notifyOff) return "none";               // Hard-Mute (stiller Status-Ping)
+  // Ältere Kettenglieder schicken alertedFp noch nicht mit → auf prev zurückfallen,
+  // sonst würde beim Rollout jeder Ping erneut mailen.
+  const gemeldet = alertedFp === undefined ? prev : alertedFp;
   if (hasProblems) {
-    const isNew = fp !== prev;                // Problemtyp hat sich geändert
-    const remindDue = sinceAlert >= remind;   // dasselbe Problem lange offen → Erinnerung
-    return isNew || remindDue ? "problem" : "none";
+    if (fp !== prev) return "none";           // erst bestätigen lassen
+    if (fp !== gemeldet) return "problem";    // zweimal gesehen, noch nicht gemeldet
+    return sinceAlert >= remind ? "problem" : "none"; // sonst nur die 2h-Erinnerung
   }
-  // Keine Probleme: nur mailen, wenn davor ein echtes Problem lief (Entwarnung).
-  return prev && prev !== "OK" ? "resolved" : "none";
+  // Keine Probleme: nur mailen, wenn über ein Problem auch wirklich informiert wurde.
+  return gemeldet && gemeldet !== "OK" ? "resolved" : "none";
+}
+
+// Eine Alarm-Mail ohne nächsten Schritt ist nur Beunruhigung. Pro erkanntem
+// Problem genau eine Zeile, was jetzt zu tun ist — in der Reihenfolge, in der man
+// es abarbeiten würde (Ursache vor Symptom).
+function naechsteSchritte({ zernio, ingestion, n8n, execErrors, replyGap }) {
+  const s = [];
+  if (zernio?.ok === false) {
+    s.push("→ Zernio-Dashboard: Webhook wieder aktivieren. Er ist die Quelle — solange er aus ist, hilft alles andere nichts.");
+  }
+  if (!n8n?.ok) {
+    s.push("→ n8n-Server prüfen (Hetzner bei Dimi). Beim letzten Mal war die Rechnung nicht bezahlt und der Server suspendiert.");
+  }
+  if (execErrors?.offenders?.length) {
+    s.push("→ n8n öffnen, Executions des genannten Workflows ansehen. Meist ist Supabase kurz nicht erreichbar.");
+  }
+  if (ingestion?.dead) {
+    s.push("→ Kette Zernio → n8n → Supabase durchgehen. Wenn Zernio oben gesund meldet, liegt es hinter dem Webhook.");
+  }
+  if (replyGap?.stalledReply) {
+    s.push("→ Genannte Chats im Dashboard öffnen. Antwortet ein Mensch bereits, ist nichts zu tun; sonst KI-Status des Chats prüfen.");
+  }
+  return s.length ? s : ["→ Details siehe oben."];
 }
 
 async function sendEmail(subject, text) {
@@ -505,7 +512,7 @@ export default async function handler(req, res) {
       .map((c) => `${c.account}/${String(c.chat).slice(0, 8)} (${c.inboundAgeMin} Min)`)
       .join(", ");
     problems.push(
-      `${replyGap.stuckCount} Chat(s) warten > ${replyGap.gapMin} Min auf KI-Antwort, obwohl die KI zuständig ist (nicht pausiert/übernommen): ${detail} — KI empfängt, antwortet aber nicht`
+      `${replyGap.stuckCount} Chat(s) ohne KI-Antwort, ältester seit ${replyGap.oldestStuckMin} Min, obwohl die KI zuständig ist (nicht pausiert/übernommen): ${detail}`
     );
   }
   // Test-Trigger: ?simulate=down erzwingt einen Alarm (Alarm-Weg-Test).
@@ -514,6 +521,7 @@ export default async function handler(req, res) {
   // Alarm-Entprellung: Zustand kommt vom Aufrufer (GitHub-Action) via Query.
   const fp = computeFingerprint({ ingestion, n8n, execErrors, replyGap, zernio }, problems.length > 0);
   const prev = typeof req.query?.prev === "string" ? req.query.prev : null;
+  const alertedFp = typeof req.query?.alertedFp === "string" ? req.query.alertedFp : undefined;
   const sinceAlert = Number(req.query?.sinceAlert);
   const remind = Number(req.query?.remind || process.env.REMIND_SEC || 7200); // 2h Default
   const notifyOff = req.query?.notify === "0";
@@ -521,6 +529,7 @@ export default async function handler(req, res) {
     hasProblems: problems.length > 0,
     fp,
     prev,
+    alertedFp,
     sinceAlert: Number.isFinite(sinceAlert) ? sinceAlert : Infinity,
     remind,
     notifyOff,
@@ -534,12 +543,12 @@ export default async function handler(req, res) {
       "",
       ...problems.map((p) => "• " + p),
       "",
-      `Zeit: ${new Date().toISOString()}`,
-      "Checks: Ingestion-Frische + n8n-Erreichbarkeit + Workflow-Fehler (Executions-API) + Reply-Gap.",
-      "→ Bei INGESTION TOT: Zernio-Verbindung prüfen (Webhook /zernio-ig kommt nicht an).",
-      "→ Sonst: n8n öffnen (Executions), betroffenen Workflow prüfen; oft Supabase-Erreichbarkeit.",
+      "Was zu tun ist:",
+      ...naechsteSchritte({ zernio, ingestion, n8n, execErrors, replyGap }),
       "",
-      "(Diese Meldung wiederholt sich frühestens in 2h, solange dasselbe Problem anhält.)",
+      `Zeit: ${new Date().toISOString()}`,
+      "(Gemeldet wird erst, wenn ein Problem zweimal hintereinander auftaucht — diese",
+      "Meldung stand also mindestens 5 Minuten an. Wiederholung frühestens in 2h.)",
     ].join("\n");
     const [email, tg] = await Promise.all([sendEmail(subject, body), sendTelegram(subject + "\n\n" + body)]);
     alerted = { problem: true, email, telegram: tg };

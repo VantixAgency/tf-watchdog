@@ -86,3 +86,27 @@ gemessen — der Supabase-service_role-Key liegt bei Dimi/Luca, Vercel gibt ihn 
 geschwärzt heraus. Ist die Annahme falsch, verzögert sie die Erkennung eines echten
 Ausfalls um bis zu ~10 h; die 48-h-Reißleine begrenzt den Schaden. Mit dem Key wäre
 später eine selbstlernende Schwelle aus echter Historie möglich (Variante B).
+
+---
+
+## Nachtrag, selben Tag: die Aktivstunden sind wieder raus
+
+Wenige Stunden nach diesem Entwurf kam `checkZernio()` dazu — der Webhook-Status wird
+direkt bei Zernio abgefragt. Damit war die oben beschriebene Mechanik überflüssig:
+
+Der Aktivstunden-Ansatz war ein **Rückschluss aus Stille** und brauchte deshalb eine
+Annahme darüber, wann Kunden schreiben (09–23 Uhr). Diese Annahme ließ sich mangels
+Supabase-Zugang nie überprüfen. Zernio beantwortet dieselbe Frage als **Auskunft**:
+deterministisch, in 5 Minuten statt in Stunden, ohne jede Uhr.
+
+Geblieben ist eine grobe Reißleine: `ageHours > 36`. Sie deckt den Restfall ab, dass
+Zernio sich gesund meldet und trotzdem nichts ankommt. 36 h liegt weit über der
+längsten je beobachteten natürlichen Lücke (16,3 h) und halbiert die blinde Zeit
+gegenüber 48 h, falls der Zernio-Check ausfällt — er hängt an einem aus dem
+Outreach-Projekt geborgten API-Key.
+
+Die beiden historischen Fehlalarme bleiben als Regressionsfälle in
+`test/ingestion.test.js`. Die Aktivstunden-Tests sind entfallen.
+
+**Lehre:** Erst prüfen, ob die Quelle direkt befragt werden kann. Ein Rückschluss aus
+Stille braucht immer Annahmen, und Annahmen über Uhrzeiten altern schlecht.
