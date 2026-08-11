@@ -27,6 +27,9 @@
 //   SUPABASE_URL            optional (Reply-Gap-Check)
 //   SUPABASE_SERVICE_KEY    optional (Service-Role, für RLS-freien Read)
 //   REPLY_GAP_MIN           optional, Default 25 (Min. ohne Antwort trotz Eingang)
+//   INGEST_ACTIVE_STALE_H   optional, Default 12 (Aktivstunden Stille = Ingestion tot)
+//   INGEST_HARD_STALE_H     optional, Default 48 (Wanduhr-Reißleine, fensterunabhängig)
+//   INGEST_ACTIVE_FROM/_TO  optional, Default 9/23 (Aktivfenster, Stunden Europe/Berlin)
 //
 // Kritische Workflows (n8n-IDs → Klartext). Erroren die, ist die KI beeinträchtigt.
 const CRITICAL_WORKFLOWS = {
@@ -109,11 +112,81 @@ async function checkExecutionErrors(n8nUrl) {
 // Stille. Dieser Check misst das Alter der jüngsten eingehenden Nachricht system-
 // weit; ist es > INGEST_STALE_HOURS, ist die Ingestion mit hoher Sicherheit tot.
 // (Genau das lief 2026-06-25 bis 2026-07-08 unbemerkt: 13 Tage, 312h.)
+//
+// FEHLALARM-FIX 2026-08-11: Gemessen wurde ursprünglich reine WANDUHR-Zeit. Die
+// läuft aber nachts weiter, wo naturgemäß niemand schreibt — der Check konnte
+// "gerade schreibt keiner" nicht von "Pipeline tot" unterscheiden und meldete nach
+// ruhigen Nächten Ausfälle (belegt 07.08. 10:46 nach 13,6h Lücke und 08.08. 05:29
+// nach 16,3h; beide gingen von selbst weg, sobald die erste DM des Tages kam).
+// Das ist gefährlicher als es klingt: Dieser Check ist das Netz gegen den stillen
+// 13-Tage-Ausfall vom Juni — ein Melder, dem man nicht mehr glaubt, ist keiner.
+// Neu zählen nur Stunden, in denen überhaupt DMs eintrudeln (Fenster 09-23 Berlin),
+// plus eine 48h-Wanduhr-Reißleine, falls die Fenster-Annahme mal nicht mehr stimmt.
+const BERLIN_HOUR = new Intl.DateTimeFormat("en-GB", {
+  timeZone: "Europe/Berlin",
+  hour: "2-digit",
+  hourCycle: "h23",
+});
+
+// Stunden zwischen zwei Zeitpunkten, die ins tägliche Aktivfenster fallen.
+// Schrittweise gezählt statt per Datumsarithmetik — so ist die Sommer-/Winterzeit-
+// Umstellung automatisch korrekt, weil die Berliner Stunde je Schritt direkt aus
+// der Zeitzonen-Datenbank kommt.
+export function activeHoursBetween(fromMs, toMs, opts = {}) {
+  const { fromHour = 9, toHour = 23, stepMin = 15, capH = 72 } = opts;
+  if (!(toMs > fromMs)) return 0;
+  const stepMs = stepMin * 60000;
+  const start = Math.max(fromMs, toMs - capH * 3.6e6);
+  let active = 0;
+  for (let t = start; t < toMs; t += stepMs) {
+    // Letzter Schritt wird angeschnitten, sonst zählte eine Zwei-Minuten-Lücke
+    // als volle Viertelstunde.
+    const span = Math.min(stepMs, toMs - t);
+    const h = Number(BERLIN_HOUR.format(new Date(t + span / 2))) % 24;
+    if (h >= fromHour && h < toHour) active += span / 3.6e6;
+  }
+  return Math.round(active * 100) / 100;
+}
+
+// Bewertet die Stille rein rechnerisch (keine Netz-Zugriffe) — dadurch gegen die
+// beiden echten Fehlalarme testbar, siehe test/ingestion.test.js.
+export function ingestionVerdict(lastMs, nowMs, opts = {}) {
+  const activeThresholdH = Number(opts.activeThresholdH ?? process.env.INGEST_ACTIVE_STALE_H ?? 12);
+  const hardThresholdH = Number(opts.hardThresholdH ?? process.env.INGEST_HARD_STALE_H ?? 48);
+  const fromHour = Number(opts.fromHour ?? process.env.INGEST_ACTIVE_FROM ?? 9);
+  const toHour = Number(opts.toHour ?? process.env.INGEST_ACTIVE_TO ?? 23);
+
+  const ageHours = Math.round(((nowMs - lastMs) / 3.6e6) * 10) / 10;
+  const activeHours = activeHoursBetween(lastMs, nowMs, {
+    fromHour,
+    toHour,
+    capH: hardThresholdH + 24,
+  });
+
+  // Reißleine zuerst: bei langen Ausfällen ist die Wanduhr-Zahl die ehrlichere
+  // Aussage — die Aktivstunden sind dann durch den Scan-Deckel gekappt.
+  let reason = null;
+  if (ageHours > hardThresholdH) {
+    reason = `${ageHours}h Wanduhr ohne DM (Reißleine ${hardThresholdH}h)`;
+  } else if (activeHours > activeThresholdH) {
+    reason = `${activeHours} Aktivstunden ohne DM (Schwelle ${activeThresholdH}, Fenster ${fromHour}-${toHour} Uhr)`;
+  }
+
+  return {
+    ageHours,
+    activeHours,
+    activeWindow: `${fromHour}-${toHour}`,
+    activeThresholdH,
+    hardThresholdH,
+    dead: reason !== null,
+    reason,
+  };
+}
+
 async function checkIngestion() {
   const url = process.env.SUPABASE_URL;
   const key = process.env.SUPABASE_SERVICE_KEY;
   if (!url || !key) return { skipped: true, reason: "SUPABASE_SERVICE_KEY nicht gesetzt" };
-  const staleH = Number(process.env.INGEST_STALE_HOURS || 12);
   const base = url.replace(/\/$/, "");
   const headers = { apikey: key, Authorization: `Bearer ${key}` };
   try {
@@ -126,15 +199,12 @@ async function checkIngestion() {
     const rows = await res.json();
     const last = rows?.[0]?.created_at ? new Date(rows[0].created_at) : null;
     if (!last) return { skipped: false, ok: false, reason: "keine eingehenden Nachrichten in DB" };
-    const ageH = (Date.now() - last.getTime()) / 3.6e6;
-    const dead = ageH > staleH;
+    const verdict = ingestionVerdict(last.getTime(), Date.now());
     return {
       skipped: false,
-      ok: !dead,
+      ok: !verdict.dead,
       lastInbound: last.toISOString(),
-      ageHours: Math.round(ageH * 10) / 10,
-      staleThresholdH: staleH,
-      dead,
+      ...verdict,
     };
   } catch (e) {
     return { skipped: false, ok: true, note: "Ingestion-Check fehlgeschlagen: " + String(e).slice(0, 100) };
@@ -288,7 +358,7 @@ export default async function handler(req, res) {
   const problems = [];
   // Ingestion zuerst — das ist der gefährlichste, weil komplett stille Ausfall.
   if (ingestion.dead) {
-    problems.push(`INGESTION TOT: seit ${ingestion.ageHours}h keine eingehende DM in der DB (letzte ${ingestion.lastInbound}). Zernio→n8n liefert nicht — Instagram-DMs werden NICHT verarbeitet.`);
+    problems.push(`INGESTION TOT: seit ${ingestion.ageHours}h keine eingehende DM in der DB (letzte ${ingestion.lastInbound}) — ${ingestion.reason}. Zernio→n8n liefert nicht — Instagram-DMs werden NICHT verarbeitet.`);
   }
   if (ingestion.reason === "keine eingehenden Nachrichten in DB") {
     problems.push("INGESTION: keine eingehenden Nachrichten in der DB gefunden — Pipeline prüfen.");
