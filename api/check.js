@@ -245,6 +245,78 @@ async function checkIngestion() {
   }
 }
 
+// ---- Zernio-Webhook: die QUELLE fragen statt aus Stille zu schließen ---------
+// Der Ingestion-Check oben ist ein Rückschluss ("seit X Stunden nichts gehört,
+// also wohl tot") und braucht deshalb Annahmen über Uhrzeiten. Zernio beantwortet
+// dieselbe Frage direkt: Der 13-Tage-Ausfall im Juni war ein AUTO-DEAKTIVIERTER
+// Webhook (isActive:false, disabledReason:auto:consecutive_failures) — das stand
+// die ganze Zeit in der API, es hat nur niemand gefragt.
+// Zusätzlich zählt Zernio Fehlzustellungen, BEVOR es abschaltet: der fremde
+// SAM-Webhook lief acht Tage auf Fehlern, ehe er deaktiviert wurde. Genau diese
+// Vorwarnzeit nutzt der Check.
+export function zernioVerdict(payload, opts = {}) {
+  const match = opts.match || process.env.ZERNIO_WEBHOOK_MATCH || "tattoo-fashion-zernio-ingest";
+  const failureThreshold = Number(opts.failureThreshold ?? process.env.ZERNIO_FAILURE_THRESHOLD ?? 3);
+  const list = payload?.webhooks;
+  if (!Array.isArray(list)) {
+    // Antwortform überrascht → NICHT alarmieren. Ein Monitor, der bei jeder
+    // API-Änderung schreit, wird weggeklickt.
+    return { ok: true, note: "Zernio-Antwort unerwartet (keine webhooks-Liste)" };
+  }
+
+  const wh = list.find((w) => String(w?.url || "").includes(match));
+  if (!wh) {
+    return {
+      ok: false,
+      found: false,
+      problems: [`Zernio-Webhook für "${match}" ist nicht registriert — Zernio liefert keine DMs mehr an n8n.`],
+      // Fremde Webhooks nur namentlich, zur Orientierung. Niemals Secrets.
+      others: list.map((w) => ({ name: w?.name, isActive: w?.isActive === true })),
+    };
+  }
+
+  const problems = [];
+  if (wh.isActive !== true) {
+    problems.push(
+      `Zernio hat den Webhook DEAKTIVIERT (${wh.disabledReason || "Grund unbekannt"}${wh.disabledAt ? `, seit ${wh.disabledAt}` : ""}) — Instagram-DMs erreichen n8n nicht mehr.`
+    );
+  } else if (Number(wh.failureCount) >= failureThreshold) {
+    problems.push(
+      `Zernio-Zustellungen scheitern (${wh.failureCount} Fehler, ab ${failureThreshold} gemeldet) — noch aktiv, aber Zernio schaltet den Webhook irgendwann selbst ab.`
+    );
+  }
+
+  return {
+    ok: problems.length === 0,
+    found: true,
+    isActive: wh.isActive === true,
+    failureCount: Number(wh.failureCount) || 0,
+    lastFiredAt: wh.lastFiredAt || null,
+    disabledReason: wh.disabledReason || null,
+    problems,
+    others: list
+      .filter((w) => w !== wh)
+      .map((w) => ({ name: w?.name, isActive: w?.isActive === true })),
+  };
+}
+
+async function checkZernio() {
+  const key = process.env.ZERNIO_API_KEY;
+  if (!key) return { skipped: true, reason: "ZERNIO_API_KEY nicht gesetzt" };
+  const base = process.env.ZERNIO_API_URL || "https://zernio.com/api/v1";
+  try {
+    const res = await withTimeout(
+      (signal) => fetch(`${base}/webhooks/settings`, {
+        signal,
+        headers: { Authorization: `Bearer ${key}` },
+      }), 10000);
+    if (!res.ok) return { skipped: false, ok: true, note: `Zernio-Check HTTP ${res.status}` };
+    return { skipped: false, ...zernioVerdict(await res.json()) };
+  } catch (e) {
+    return { skipped: false, ok: true, note: "Zernio-Check fehlgeschlagen: " + String(e).slice(0, 100) };
+  }
+}
+
 // Der zweite Blind-Spot — DMs kommen rein, aber KEINE Antwort geht raus.
 // Bleibt inaktiv, bis SUPABASE_SERVICE_KEY gesetzt ist.
 //
@@ -336,7 +408,7 @@ async function checkReplyGap() {
 
 // Stabiler Fingerprint NUR aus Zustands-Flags — bewusst OHNE Minutenzahlen,
 // damit er sich nicht bei jedem Ping ändert, solange dasselbe Problem anhält.
-export function computeFingerprint({ ingestion, n8n, execErrors, replyGap }, hasProblems) {
+export function computeFingerprint({ ingestion, n8n, execErrors, replyGap, zernio }, hasProblems) {
   if (!hasProblems) return "OK";
   const offenders = (execErrors?.offenders || []).map((o) => o.workflowId).sort().join(",");
   return [
@@ -344,6 +416,9 @@ export function computeFingerprint({ ingestion, n8n, execErrors, replyGap }, has
     `n8n:${!n8n?.ok}`,
     `exec:${offenders}`,
     `reply:${!!replyGap?.stalledReply}`,
+    // Nicht `!zernio?.ok` — ein übersprungener Check (kein API-Key) hat gar kein
+    // ok-Feld und darf nicht als Problem durchgehen.
+    `zern:${zernio?.ok === false}`,
   ].join("|");
 }
 
@@ -398,15 +473,19 @@ export default async function handler(req, res) {
   }
 
   const n8nUrl = process.env.N8N_URL || "https://n8n.dimi-it.com";
-  const [n8n, execErrors, ingestion, replyGap] = await Promise.all([
+  const [n8n, execErrors, ingestion, replyGap, zernio] = await Promise.all([
     checkN8n(n8nUrl),
     checkExecutionErrors(n8nUrl),
     checkIngestion(),
     checkReplyGap(),
+    checkZernio(),
   ]);
 
   const problems = [];
-  // Ingestion zuerst — das ist der gefährlichste, weil komplett stille Ausfall.
+  // Zernio zuerst: die einzige Auskunft, die kein Rückschluss ist. Sagt Zernio
+  // "Webhook aus", ist die Ursache damit benannt, nicht nur das Symptom.
+  for (const p of zernio.problems || []) problems.push(`ZERNIO: ${p}`);
+  // Dann die Stille — der gefährlichste, weil komplett lautlose Ausfall.
   if (ingestion.dead) {
     problems.push(`INGESTION TOT: seit ${ingestion.ageHours}h keine eingehende DM in der DB (letzte ${ingestion.lastInbound}) — ${ingestion.reason}. Zernio→n8n liefert nicht — Instagram-DMs werden NICHT verarbeitet.`);
   }
@@ -433,7 +512,7 @@ export default async function handler(req, res) {
   if (req.query?.simulate === "down") problems.push("TEST-ALARM (simulate=down) — kein echtes Problem, nur Alarm-Weg-Test.");
 
   // Alarm-Entprellung: Zustand kommt vom Aufrufer (GitHub-Action) via Query.
-  const fp = computeFingerprint({ ingestion, n8n, execErrors, replyGap }, problems.length > 0);
+  const fp = computeFingerprint({ ingestion, n8n, execErrors, replyGap, zernio }, problems.length > 0);
   const prev = typeof req.query?.prev === "string" ? req.query.prev : null;
   const sinceAlert = Number(req.query?.sinceAlert);
   const remind = Number(req.query?.remind || process.env.REMIND_SEC || 7200); // 2h Default
@@ -486,6 +565,7 @@ export default async function handler(req, res) {
     executionErrors: execErrors,
     ingestion,
     replyGap,
+    zernio,
     problems,
     fp,
     healthy: problems.length === 0,
