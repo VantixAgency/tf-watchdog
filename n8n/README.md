@@ -21,6 +21,10 @@ Deshalb:
 - `health-check.live.js` — Snapshot des Node-Codes, wie er in n8n wirklich steht.
 - `../test/node-paritaet.test.js` — schneidet die Funktionen aus dem Snapshot heraus und
   lässt sie gegen das Modul antreten. Weicht die Produktion ab, wird der Test rot.
+- `../test/health-check-e2e.test.js` — führt den **kompletten** Node-Code gegen eine
+  nachgebaute Supabase-REST-Schnittstelle aus (inklusive der serverseitigen Zeitfilter)
+  und prüft, was am Ende bei `send` herauskommt. Das ist der Wert, an dem der
+  „Alert?"-Node Telegram und Mail aufhängt.
 
 ## Wenn du die Schwellen änderst
 
@@ -44,3 +48,19 @@ Stand 25.08.2026 (Promise: „ich will keine Meldungen mehr von Nicht-Ausfällen
   weggeht, hat nie jemanden gestört.
 - Unbekannte Problemklassen bleiben **immer** meldepflichtig — einen neuen Fehlertyp
   still zu schlucken wäre genau das Blindloch, das ein Watchdog nie haben darf.
+
+## ⚠️ Ladefenster und Schwelle hängen zusammen
+
+Der Node lädt Nachrichten nur aus einem Zeitfenster (`ANSWER_FLOOR`, aktuell **90 Min**).
+Eine Kundennachricht, die älter ist, kommt in der Abfrage gar nicht mehr vor — der Chat
+kann dann nicht mehr als hängend erkannt werden.
+
+Beim Umbau am 25.08.2026 stand das Fenster noch auf 30 Min, während die neue
+Liegenbleiber-Regel bei 60 Min greifen sollte. Die Regel wäre also **nie** angesprungen:
+Einzelfall-Meldungen abgeschaltet, Ersatzregel tot. Aufgefallen ist das nur, weil
+`test/health-check-e2e.test.js` den echten Node-Code gegen eine nachgebaute Datenbank
+laufen lässt — die Unit-Tests der Entscheidungsfunktion konnten es nicht sehen, weil sie
+die Datenbeschaffung gar nicht kennen.
+
+**Regel: `ANSWER_FLOOR` muss immer größer sein als `FLUGHOEHE.dmHardMin`.**
+Ein Test prüft das; wer eine der beiden Zahlen ändert, wird an die andere erinnert.

@@ -1,8 +1,8 @@
 // SNAPSHOT des Live-Node-Codes aus n8n jmKYSADWCfHFQyqr / Node "Health Check".
-// Gezogen 2026-08-25 nach dem Flughoehen-Fix. Dient dem Paritaetstest
-// (test/node-paritaet.test.js): die Kopie im Produktions-Node muss exakt so
-// entscheiden wie das getestete Modul n8n/alarm-flughoehe.js.
-// NICHT importierbar (n8n-Globals) - der Test extrahiert nur die Funktionen.
+// Gezogen 2026-08-25 nach dem Flughoehen-Fix + der Ladefenster-Korrektur.
+// Dient dem Paritaetstest (test/node-paritaet.test.js) und dem E2E-Test
+// (test/health-check-e2e.test.js), der diesen Code wirklich ausfuehrt.
+// NICHT importierbar (n8n-Globals) - die Tests extrahieren bzw. wrappen ihn.
 
 
 function buildOffWindows(events) {
@@ -90,7 +90,7 @@ const h={apikey:key,Authorization:'Bearer '+key};
 async function q(p){ return await httpRequest({method:'GET',url:url+'/rest/v1/'+p,headers:h,json:true,timeout:8000}); }
 const now=Date.now();
 const iso=(ms)=>new Date(ms).toISOString();
-const EVT_WINDOW=now-15*60*1000, ANSWER_FLOOR=now-30*60*1000, ANSWER_CEIL=now-7*60*1000 /*FIX 2026-06-11: 4->7min, KI buffert Nachrichtenbursts; 4min war zu eng -> vorzeitige 'unbeantwortet'-Alarme*/;
+const EVT_WINDOW=now-15*60*1000, ANSWER_FLOOR=now-90*60*1000 /*FIX 2026-08-25: 30->90 Min. Die neue Liegenbleiber-Regel meldet einen EINZELNEN Chat ab 60 Min. Mit dem alten 30-Min-Ladefenster haette sie NIE greifen koennen: die ausloesende Kundennachricht waere da laengst aus dieser Abfrage gefallen. Damit waere die Einzelfall-Meldung ersatzlos abgeschaltet gewesen — genau das Blindloch, das der Umbau vermeiden sollte. REGEL: dieses Fenster muss immer groesser bleiben als FLUGHOEHE.dmHardMin. Geprueft in test/health-check-e2e.test.js.*/, ANSWER_CEIL=now-7*60*1000 /*FIX 2026-06-11: 4->7min, KI buffert Nachrichtenbursts; 4min war zu eng -> vorzeitige 'unbeantwortet'-Alarme*/;
 
 const accounts=await q('accounts?select=id,slug,display_name,ki_global_on,zernio_account_id');
 const live=accounts.filter(a=>a.zernio_account_id);
