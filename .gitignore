@@ -1,1 +1,6 @@
 .vercel
+# Workflow-Backups aus n8n bleiben LOKAL: die exportierten JSONs enthalten
+# Klartext-Secrets (u.a. den Telegram-Bot-Token in der httpRequest-URL), und
+# dieses Repo ist oeffentlich. Getestet wird stattdessen der Snapshot des
+# reinen Node-Codes in n8n/health-check.live.js — der enthaelt nur $env-Namen.
+n8n-backup/
