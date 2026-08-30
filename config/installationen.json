@@ -1,0 +1,59 @@
+{
+  "$kommentar": [
+    "G4 — Monitoring-Konfiguration je Installation.",
+    "KEINE Secrets. Nur Namen von Umgebungsvariablen unter secretRefs.",
+    "Eine Workflow-ID darf hoechstens einer Organisation gehoeren (Cross-Tenant-Schutz)."
+  ],
+  "organisationen": [
+    {
+      "id": "tattoo-fashion",
+      "anzeigename": "Tattoo Fashion",
+      "kritischeWorkflows": [
+        {
+          "id": "C4VjxQI2NGcYKKn5",
+          "bezeichnung": "KI-Trigger-Poll (holt faellige Chats)"
+        },
+        {
+          "id": "pTXykbS5npfLp7nF",
+          "bezeichnung": "KI-Reply-Runner (erzeugt+sendet Antwort)"
+        },
+        {
+          "id": "jmKYSADWCfHFQyqr",
+          "bezeichnung": "KI-Health-Monitor (intern)"
+        },
+        {
+          "id": "aN9yDA7rqNUWeTDX",
+          "bezeichnung": "KI-Self-Heal-Watchdog (intern)"
+        }
+      ],
+      "pruefungen": [
+        "n8n_erreichbar",
+        "workflow_fehler",
+        "ingestion",
+        "provider_webhook",
+        "antwort_stau"
+      ],
+      "provider": {
+        "art": "zernio",
+        "webhookMatch": "tattoo-fashion-zernio-ingest"
+      },
+      "alarm": {
+        "betreffProblem": "Tattoo Fashion Automation: PROBLEM",
+        "betreffOk": "Tattoo Fashion Automation: wieder OK",
+        "absender": "TF Watchdog <onboarding@resend.dev>",
+        "email": [
+          "info@vantixai.de"
+        ],
+        "telegramChatIds": []
+      },
+      "schwellen": {},
+      "secretRefs": {
+        "n8nApiKey": "N8N_API_KEY",
+        "providerApiKey": "ZERNIO_API_KEY",
+        "datenbankUrl": "SUPABASE_URL",
+        "datenbankKey": "SUPABASE_SERVICE_ROLE_KEY"
+      },
+      "n8nUrl": "https://n8n.dimi-it.com"
+    }
+  ]
+}

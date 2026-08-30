@@ -1,5 +1,7 @@
 // TF Watchdog — externer Monitor (läuft auf Vercel, NICHT auf dem n8n-Server).
-// Prüft mehrschichtig, ob die Tattoo-Fashion-KI-Automation wirklich arbeitet:
+// Prüft mehrschichtig, ob die KI-Automation einer Installation wirklich arbeitet.
+// Welche Workflows, Empfänger, Schwellen und Anbieter das sind, steht NICHT hier,
+// sondern in config/installationen.json — je Organisation (G4).
 //   1) Ist n8n überhaupt erreichbar?
 //   2) Erroren die kritischen Workflows? (n8n Executions API)  ← NEU, Hauptschutz
 //   3) Kommen DMs rein, aber es geht KEINE Antwort raus? (Supabase, optional)  ← NEU
@@ -14,12 +16,12 @@
 // schlägt an, sobald die Pipeline-Workflows sichtbar erroren.
 //
 // Env-Vars (Vercel):
-//   N8N_URL                 z.B. https://n8n.dimi-it.com          (Default gesetzt)
+//   N8N_URL                 Fallback, wenn die Organisation keinen n8nUrl nennt
 //   N8N_API_KEY             n8n Public-API-Key (Settings → API)   ← nötig für Check 2
 //   CRON_SECRET             schützt den Endpoint (Vercel-Cron sendet Bearer)
 //   RESEND_API_KEY          für Email-Alarm
-//   ALERT_EMAIL             Empfänger (z.B. info@vantixai.de)
-//   ALERT_FROM              Absender (z.B. "TF Watchdog <buchung@callsam.io>")
+//   ALERT_EMAIL             Fallback-Empfänger (Organisation geht vor)
+//   ALERT_FROM              Fallback-Absender (Organisation geht vor)
 //   TELEGRAM_BOT_TOKEN      optional
 //   TELEGRAM_CHAT_ID        optional
 //   ERROR_WINDOW_MIN        optional, Default 30 (Fehler-Fenster)
@@ -31,15 +33,34 @@
 //   REPLY_GAP_HARD_MIN      optional, Default 60 (ein Chat so lange = liegen geblieben)
 //   INGEST_HARD_STALE_H     optional, Default 36 (Reißleine; schnell meldet Zernio)
 //   ZERNIO_API_KEY          Zernio-Webhook-Status (der eigentliche Ingestion-Melder)
-//   ZERNIO_WEBHOOK_MATCH    optional, Default "tattoo-fashion-zernio-ingest"
+//   ZERNIO_WEBHOOK_MATCH    Fallback; regulär aus provider.webhookMatch der Organisation
 //
-// Kritische Workflows (n8n-IDs → Klartext). Erroren die, ist die KI beeinträchtigt.
-const CRITICAL_WORKFLOWS = {
-  C4VjxQI2NGcYKKn5: "KI-Trigger-Poll (holt fällige Chats)",
-  pTXykbS5npfLp7nF: "KI-Reply-Runner (erzeugt+sendet Antwort)",
-  jmKYSADWCfHFQyqr: "KI-Health-Monitor (intern)",
-  aN9yDA7rqNUWeTDX: "KI-Self-Heal-Watchdog (intern)",
-};
+// G4: Keine fest codierten Workflow-IDs, Namen, Empfänger oder Anbieter mehr.
+// Die Überwachung wird je Installation konfiguriert — siehe config/installationen.json.
+// Ein zweiter Mandant wäre sonst unüberwacht geblieben.
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import { dirname, join } from "node:path";
+import { pruefeKonfiguration, mitVorgaben } from "../config/schema.mjs";
+
+const HIER = dirname(fileURLToPath(import.meta.url));
+
+/** Lädt und VALIDIERT die Monitoring-Konfiguration. Ungültig = harter Fehler, kein stiller Betrieb. */
+export function ladeKonfiguration(pfad = join(HIER, "..", "config", "installationen.json")) {
+  const roh = JSON.parse(readFileSync(pfad, "utf8"));
+  const pruefung = pruefeKonfiguration(roh);
+  if (!pruefung.ok) {
+    const e = new Error("Monitoring-Konfiguration ungueltig:\n  " + pruefung.fehler.join("\n  "));
+    e.code = "CONFIG_INVALID";
+    throw e;
+  }
+  return { ...roh, organisationen: roh.organisationen.map(mitVorgaben) };
+}
+
+/** Workflow-ID → Bezeichnung, NUR für diese Organisation. Cross-Tenant-Zugriff unmöglich. */
+export function workflowIndex(org) {
+  return Object.fromEntries((org.kritischeWorkflows || []).map((w) => [w.id, w.bezeichnung]));
+}
 
 async function withTimeout(fn, ms) {
   const ctrl = new AbortController();
@@ -103,11 +124,12 @@ export function kiWindowActive(account = {}, nowMs = Date.now()) {
 
 // NEU: Fragt die n8n-Executions-API und zählt Fehler der kritischen Workflows im
 // Zeitfenster. Genau DAS hätte den Vorfall 2026-07-08 gemeldet.
-async function checkExecutionErrors(n8nUrl) {
-  const apiKey = process.env.N8N_API_KEY;
-  if (!apiKey) return { skipped: true, reason: "N8N_API_KEY nicht gesetzt" };
-  const windowMin = Number(process.env.ERROR_WINDOW_MIN || 30);
-  const threshold = Number(process.env.ERROR_THRESHOLD || 4);
+async function checkExecutionErrors(n8nUrl, org) {
+  const apiKey = process.env[org?.secretRefs?.n8nApiKey || "N8N_API_KEY"];
+  if (!apiKey) return { skipped: true, reason: "n8n-API-Key nicht gesetzt" };
+  const KRITISCH = workflowIndex(org);
+  const windowMin = Number(org?.schwellen?.fehlerFensterMin ?? process.env.ERROR_WINDOW_MIN ?? 30);
+  const threshold = Number(org?.schwellen?.fehlerSchwelle ?? process.env.ERROR_THRESHOLD ?? 4);
   const since = Date.now() - windowMin * 60 * 1000;
   try {
     const res = await withTimeout(
@@ -123,17 +145,17 @@ async function checkExecutionErrors(n8nUrl) {
       const started = e.startedAt ? new Date(e.startedAt).getTime() : 0;
       if (started < since) continue;
       const wf = e.workflowId;
-      if (CRITICAL_WORKFLOWS[wf]) counts[wf] = (counts[wf] || 0) + 1;
+      if (KRITISCH[wf]) counts[wf] = (counts[wf] || 0) + 1;   // fremde Workflows: ignoriert
     }
     const offenders = Object.entries(counts)
       .filter(([, n]) => n >= threshold)
-      .map(([wf, n]) => ({ workflowId: wf, name: CRITICAL_WORKFLOWS[wf], errors: n }));
+      .map(([wf, n]) => ({ workflowId: wf, name: KRITISCH[wf], errors: n }));
     return {
       skipped: false,
       ok: offenders.length === 0,
       windowMin,
       threshold,
-      counts: Object.fromEntries(Object.entries(counts).map(([wf, n]) => [CRITICAL_WORKFLOWS[wf], n])),
+      counts: Object.fromEntries(Object.entries(counts).map(([wf, n]) => [KRITISCH[wf], n])),
       offenders,
     };
   } catch (e) {
@@ -169,8 +191,10 @@ export function ingestionVerdict(lastMs, nowMs, opts = {}) {
   };
 }
 
-async function checkIngestion() {
-  const url = process.env.SUPABASE_URL;
+async function checkIngestion(org) {
+  // G4: Datenbankzugang je Organisation. Ohne das laese der Melder einer Organisation
+  // in der Datenbank einer anderen -- Cross-Tenant-Datenzugriff.
+  const url = process.env[org?.secretRefs?.datenbankUrl || "SUPABASE_URL"];
   const key = process.env.SUPABASE_SERVICE_KEY;
   if (!url || !key) return { skipped: true, reason: "SUPABASE_SERVICE_KEY nicht gesetzt" };
   const base = url.replace(/\/$/, "");
@@ -207,7 +231,11 @@ async function checkIngestion() {
 // SAM-Webhook lief acht Tage auf Fehlern, ehe er deaktiviert wurde. Genau diese
 // Vorwarnzeit nutzt der Check.
 export function zernioVerdict(payload, opts = {}) {
-  const match = opts.match || process.env.ZERNIO_WEBHOOK_MATCH || "tattoo-fashion-zernio-ingest";
+  // G4: kein Kunden-Literal im Produktkern. Der Match kommt aus der Organisationskonfiguration
+  // (provider.webhookMatch). Fehlt er, wird NICHT geraten -- ein Melder, der auf einen falschen
+  // Webhook schaut, meldet Gesundheit, die es nicht gibt.
+  const match = opts.match || process.env.ZERNIO_WEBHOOK_MATCH;
+  if (!match) return { ok: true, found: false, skipped: true, reason: "kein webhookMatch konfiguriert", problems: [] };
   const failureThreshold = Number(opts.failureThreshold ?? process.env.ZERNIO_FAILURE_THRESHOLD ?? 3);
   const list = payload?.webhooks;
   if (!Array.isArray(list)) {
@@ -252,9 +280,9 @@ export function zernioVerdict(payload, opts = {}) {
   };
 }
 
-async function checkZernio() {
-  const key = process.env.ZERNIO_API_KEY;
-  if (!key) return { skipped: true, reason: "ZERNIO_API_KEY nicht gesetzt" };
+async function checkZernio(org) {
+  const key = process.env[org?.secretRefs?.providerApiKey || "ZERNIO_API_KEY"];
+  if (!key) return { skipped: true, reason: "Provider-API-Key nicht gesetzt" };
   const base = process.env.ZERNIO_API_URL || "https://zernio.com/api/v1";
   try {
     const res = await withTimeout(
@@ -263,7 +291,10 @@ async function checkZernio() {
         headers: { Authorization: `Bearer ${key}` },
       }), 10000);
     if (!res.ok) return { skipped: false, ok: true, note: `Zernio-Check HTTP ${res.status}` };
-    return { skipped: false, ...zernioVerdict(await res.json()) };
+    return { skipped: false, ...zernioVerdict(await res.json(), {
+      match: org?.provider?.webhookMatch,
+      failureThreshold: org?.schwellen?.providerFehler,
+    }) };
   } catch (e) {
     return { skipped: false, ok: true, note: "Zernio-Check fehlgeschlagen: " + String(e).slice(0, 100) };
   }
@@ -305,8 +336,10 @@ export function replyGapVerdict(stuck = [], opts = {}) {
   };
 }
 
-async function checkReplyGap() {
-  const url = process.env.SUPABASE_URL;
+async function checkReplyGap(org) {
+  // G4: Datenbankzugang je Organisation. Ohne das laese der Melder einer Organisation
+  // in der Datenbank einer anderen -- Cross-Tenant-Datenzugriff.
+  const url = process.env[org?.secretRefs?.datenbankUrl || "SUPABASE_URL"];
   const key = process.env.SUPABASE_SERVICE_KEY;
   if (!url || !key) return { skipped: true, reason: "SUPABASE_SERVICE_KEY nicht gesetzt" };
   const gapMin = Number(process.env.REPLY_GAP_MIN || 25);
@@ -442,15 +475,16 @@ function naechsteSchritte({ zernio, ingestion, n8n, execErrors, replyGap }) {
   return s.length ? s : ["→ Details siehe oben."];
 }
 
-async function sendEmail(subject, text) {
+async function sendEmail(subject, text, org) {
   const key = process.env.RESEND_API_KEY;
-  if (!key || !process.env.ALERT_EMAIL) return { skipped: true };
+  const an = org?.alarm?.email ?? (process.env.ALERT_EMAIL ? [process.env.ALERT_EMAIL] : []);
+  if (!key || an.length === 0) return { skipped: true };
   const res = await fetch("https://api.resend.com/emails", {
     method: "POST",
     headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json" },
     body: JSON.stringify({
-      from: process.env.ALERT_FROM || "TF Watchdog <onboarding@resend.dev>",
-      to: [process.env.ALERT_EMAIL],
+      from: org?.alarm?.absender || process.env.ALERT_FROM || "Watchdog <onboarding@resend.dev>",
+      to: an,
       subject,
       text,
     }),
@@ -458,16 +492,20 @@ async function sendEmail(subject, text) {
   return { ok: res.ok, status: res.status };
 }
 
-async function sendTelegram(text) {
+async function sendTelegram(text, org) {
   const token = process.env.TELEGRAM_BOT_TOKEN;
-  const chat = process.env.TELEGRAM_CHAT_ID;
-  if (!token || !chat) return { skipped: true };
-  const res = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ chat_id: chat, text }),
-  });
-  return { ok: res.ok };
+  const chats = org?.alarm?.telegramChatIds ?? (process.env.TELEGRAM_CHAT_ID ? [process.env.TELEGRAM_CHAT_ID] : []);
+  if (!token || chats.length === 0) return { skipped: true };
+  const ergebnisse = [];
+  for (const chat of chats) {
+    const res = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ chat_id: chat, text }),
+    });
+    ergebnisse.push(res.ok);
+  }
+  return { ok: ergebnisse.every(Boolean) };
 }
 
 export default async function handler(req, res) {
@@ -479,13 +517,35 @@ export default async function handler(req, res) {
     return res.status(401).json({ error: "unauthorized" });
   }
 
-  const n8nUrl = process.env.N8N_URL || "https://n8n.dimi-it.com";
+  // G4: Konfiguration laden und VALIDIEREN. Eine ungueltige Konfiguration darf nicht
+  // zu stillem Betrieb fuehren -- ein Melder, der nichts prueft, ist schlimmer als keiner.
+  let konfiguration;
+  try {
+    konfiguration = ladeKonfiguration();
+  } catch (e) {
+    return res.status(500).json({ error: "config-invalid", detail: String(e.message).slice(0, 800) });
+  }
+
+  // Genau eine Organisation je Aufruf. Standard ist die erste; ?org=<id> waehlt gezielt.
+  // Getrennte Laeufe statt Sammellauf: so kann ein Alarm der einen Organisation die
+  // andere weder verzoegern noch faelschlich betreffen.
+  const gewuenscht = req.query?.org;
+  const org = gewuenscht
+    ? konfiguration.organisationen.find((o) => o.id === gewuenscht)
+    : konfiguration.organisationen[0];
+  if (!org) {
+    return res.status(404).json({ error: "unknown-org", bekannt: konfiguration.organisationen.map((o) => o.id) });
+  }
+  const aktiv = (name) => (org.pruefungen || []).includes(name);
+
+  const n8nUrl = org.n8nUrl || process.env.N8N_URL;
+  if (!n8nUrl) return res.status(500).json({ error: "config-invalid", detail: "n8nUrl fehlt fuer " + org.id });
   const [n8n, execErrors, ingestion, replyGap, zernio] = await Promise.all([
-    checkN8n(n8nUrl),
-    checkExecutionErrors(n8nUrl),
-    checkIngestion(),
-    checkReplyGap(),
-    checkZernio(),
+    aktiv("n8n_erreichbar")  ? checkN8n(n8nUrl)                 : { skipped: true, reason: "nicht konfiguriert" },
+    aktiv("workflow_fehler") ? checkExecutionErrors(n8nUrl, org) : { skipped: true, reason: "nicht konfiguriert" },
+    aktiv("ingestion")       ? checkIngestion(org)               : { skipped: true, reason: "nicht konfiguriert" },
+    aktiv("antwort_stau")    ? checkReplyGap(org)                : { skipped: true, reason: "nicht konfiguriert" },
+    aktiv("provider_webhook")? checkZernio(org)                  : { skipped: true, reason: "nicht konfiguriert" },
   ]);
 
   const problems = [];
@@ -537,7 +597,7 @@ export default async function handler(req, res) {
 
   let alerted = null;
   if (action === "problem") {
-    const subject = "🚨 Tattoo Fashion Automation: PROBLEM";
+    const subject = "🚨 " + (org?.alarm?.betreffProblem || "Automation: PROBLEM");
     const body = [
       "Der Watchdog hat ein Problem erkannt:",
       "",
@@ -550,10 +610,10 @@ export default async function handler(req, res) {
       "(Gemeldet wird erst, wenn ein Problem zweimal hintereinander auftaucht — diese",
       "Meldung stand also mindestens 5 Minuten an. Wiederholung frühestens in 2h.)",
     ].join("\n");
-    const [email, tg] = await Promise.all([sendEmail(subject, body), sendTelegram(subject + "\n\n" + body)]);
+    const [email, tg] = await Promise.all([sendEmail(subject, body, org), sendTelegram(subject + "\n\n" + body, org)]);
     alerted = { problem: true, email, telegram: tg };
   } else if (action === "resolved") {
-    const subject = "✅ Tattoo Fashion Automation: wieder OK";
+    const subject = "✅ " + (org?.alarm?.betreffOk || "Automation: wieder OK");
     const body = [
       "Entwarnung — die Automation läuft wieder normal.",
       "",
@@ -562,7 +622,7 @@ export default async function handler(req, res) {
       "",
       `Zeit: ${new Date().toISOString()}`,
     ].join("\n");
-    const [email, tg] = await Promise.all([sendEmail(subject, body), sendTelegram(subject + "\n\n" + body)]);
+    const [email, tg] = await Promise.all([sendEmail(subject, body, org), sendTelegram(subject + "\n\n" + body, org)]);
     alerted = { resolved: true, email, telegram: tg };
   } else if (notifyOff) {
     alerted = { suppressed: true };

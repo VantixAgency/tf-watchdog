@@ -10,7 +10,13 @@
 
 import test from "node:test";
 import assert from "node:assert/strict";
-import { zernioVerdict } from "../api/check.js";
+import { zernioVerdict as _zernioVerdict } from "../api/check.js";
+
+// G4: Der Webhook-Match ist Konfiguration, kein Default im Produktkern.
+// Die Tests uebergeben ihn deshalb ausdruecklich -- so dokumentieren sie, dass ein
+// zweiter Mandant seinen eigenen Match mitbringt.
+const TF_MATCH = "tattoo-fashion-zernio-ingest";
+const zernioVerdict = (payload, opts = {}) => _zernioVerdict(payload, { match: TF_MATCH, ...opts });
 
 const TF_URL = "https://n8n.dimi-it.com/webhook/tattoo-fashion-zernio-ingest";
 
