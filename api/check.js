@@ -41,7 +41,7 @@
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
-import { pruefeKonfiguration, mitVorgaben } from "../config/schema.mjs";
+import { pruefeKonfiguration, mitVorgaben, BRAUCHT_N8N } from "../config/schema.mjs";
 
 const HIER = dirname(fileURLToPath(import.meta.url));
 
@@ -413,7 +413,7 @@ async function checkReplyGap(org) {
 
 // Stabiler Fingerprint NUR aus Zustands-Flags — bewusst OHNE Minutenzahlen,
 // damit er sich nicht bei jedem Ping ändert, solange dasselbe Problem anhält.
-export function computeFingerprint({ ingestion, n8n, execErrors, replyGap, zernio }, hasProblems) {
+export function computeFingerprint({ ingestion, n8n, execErrors, replyGap, zernio, v2 }, hasProblems) {
   if (!hasProblems) return "OK";
   const offenders = (execErrors?.offenders || []).map((o) => o.workflowId).sort().join(",");
   return [
@@ -424,6 +424,11 @@ export function computeFingerprint({ ingestion, n8n, execErrors, replyGap, zerni
     // Nicht `!zernio?.ok` — ein übersprungener Check (kein API-Key) hat gar kein
     // ok-Feld und darf nicht als Problem durchgehen.
     `zern:${zernio?.ok === false}`,
+    // Gleiche Vorsicht wie bei Zernio: Ein uebersprungener Check hat kein ok-Feld und
+    // darf nicht als Problem gelten. Ohne den Fingerabdruck wuerde ein V2-Ausfall
+    // ausserdem denselben Abdruck tragen wie ein n8n-Ausfall -- die Entprellung
+    // haette dann den zweiten Alarm als Wiederholung des ersten verschluckt.
+    `v2:${v2?.ok === false}`,
   ].join("|");
 }
 
@@ -508,6 +513,59 @@ async function sendTelegram(text, org) {
   return { ok: ergebnisse.every(Boolean) };
 }
 
+/**
+ * V2-Bereitschaft. Prueft NICHT nur, ob der Dienst antwortet.
+ *
+ * Ein Melder, der auf HTTP 200 stehenbleibt, wuerde eine stillschweigend abgeschaltete
+ * Absicherung durchgehen lassen: eine Tabelle ohne RLS, eine nicht angewendete
+ * Migration, ein auf den lokalen Ersatz zurueckgefallener Auth-Adapter. Genau diese
+ * Merkmale liefert `/api/bereit` mit, und genau die werden hier geprueft.
+ *
+ * Die erwartete Migrationszahl steht NICHT hier. Sie waere eine Zahl, die nur in einer
+ * Konfiguration lebt und bei jeder Migration nachgezogen werden muesste -- vergisst man
+ * das, meldet der Waechter Alarm ohne Anlass, und man gewoehnt sich das Wegklicken an.
+ * Geprueft wird stattdessen, dass ueberhaupt Migrationen angewendet sind und dass die
+ * Zahl nicht SINKT; den Rest entscheidet der Dienst selbst ueber `ok`.
+ */
+export async function checkV2Bereit(org, holen = fetch) {
+  const basis = String(org.v2Url || "").replace(/\/$/, "");
+  if (!basis) return { skipped: true, reason: "v2Url fehlt" };
+  const problems = [];
+  let bereit = null;
+  let gesund = null;
+  try {
+    gesund = await withTimeout(async (signal) => {
+      const a = await holen(`${basis}/api/gesund`, { signal });
+      return { status: a.status, body: await a.json().catch(() => ({})) };
+    }, 10000);
+    if (gesund.status !== 200 || gesund.body?.ok !== true)
+      problems.push(`Lebenszeichen fehlt: /api/gesund antwortet ${gesund.status}`);
+  } catch (e) {
+    problems.push(`Lebenszeichen fehlt: /api/gesund nicht erreichbar (${String(e.message).slice(0, 80)})`);
+  }
+  try {
+    bereit = await withTimeout(async (signal) => {
+      const a = await holen(`${basis}/api/bereit`, { signal });
+      return { status: a.status, body: await a.json().catch(() => ({})) };
+    }, 10000);
+  } catch (e) {
+    problems.push(`Bereitschaft nicht abfragbar (${String(e.message).slice(0, 80)})`);
+    return { ok: false, problems, bereit: null, gesund };
+  }
+  const b = bereit.body || {};
+  if (bereit.status !== 200 || b.ok !== true)
+    problems.push(`Dienst meldet sich als NICHT bereit (Status ${bereit.status})`);
+  if (!(Number(b.migrationen) > 0))
+    problems.push("keine Migration angewendet — das Schema ist leer oder falsch verbunden");
+  if (Number(b.tabellenOhneRls) !== 0)
+    problems.push(`${b.tabellenOhneRls} Tabelle(n) OHNE Row Level Security — Mandantentrennung offen`);
+  if (b.auth !== "supabase")
+    problems.push(`Auth-Kette ist "${b.auth}" statt "supabase" — der Dienst laeuft auf einem Ersatzadapter`);
+  if (b.benutzerkontext !== true)
+    problems.push("Benutzerkontext nicht verdrahtet — Zugriffe liefen privilegiert an RLS vorbei");
+  return { ok: problems.length === 0, problems, bereit: b, gesund: gesund?.body ?? null };
+}
+
 export default async function handler(req, res) {
   // Auth: Vercel-Cron sendet "Authorization: Bearer <CRON_SECRET>". Manuell: ?key=<CRON_SECRET>.
   const secret = process.env.CRON_SECRET;
@@ -539,13 +597,18 @@ export default async function handler(req, res) {
   const aktiv = (name) => (org.pruefungen || []).includes(name);
 
   const n8nUrl = org.n8nUrl || process.env.N8N_URL;
-  if (!n8nUrl) return res.status(500).json({ error: "config-invalid", detail: "n8nUrl fehlt fuer " + org.id });
-  const [n8n, execErrors, ingestion, replyGap, zernio] = await Promise.all([
+  // n8n wird nur verlangt, wenn auch etwas darauf geprueft wird. V2 laeuft als eigener
+  // Dienst; ohne diese Unterscheidung waere die Installation gar nicht ueberwachbar.
+  const brauchtN8n = (org.pruefungen || []).some((p) => BRAUCHT_N8N.includes(p));
+  if (brauchtN8n && !n8nUrl)
+    return res.status(500).json({ error: "config-invalid", detail: "n8nUrl fehlt fuer " + org.id });
+  const [n8n, execErrors, ingestion, replyGap, zernio, v2] = await Promise.all([
     aktiv("n8n_erreichbar")  ? checkN8n(n8nUrl)                 : { skipped: true, reason: "nicht konfiguriert" },
     aktiv("workflow_fehler") ? checkExecutionErrors(n8nUrl, org) : { skipped: true, reason: "nicht konfiguriert" },
     aktiv("ingestion")       ? checkIngestion(org)               : { skipped: true, reason: "nicht konfiguriert" },
     aktiv("antwort_stau")    ? checkReplyGap(org)                : { skipped: true, reason: "nicht konfiguriert" },
     aktiv("provider_webhook")? checkZernio(org)                  : { skipped: true, reason: "nicht konfiguriert" },
+    aktiv("v2_bereitschaft") ? checkV2Bereit(org)                : { skipped: true, reason: "nicht konfiguriert" },
   ]);
 
   const problems = [];
@@ -575,11 +638,12 @@ export default async function handler(req, res) {
       `${replyGap.stuckCount} Chat(s) ohne KI-Antwort, ältester seit ${replyGap.oldestStuckMin} Min, obwohl die KI zuständig ist (nicht pausiert/übernommen): ${detail}`
     );
   }
+  for (const p of v2.problems || []) problems.push(`V2: ${p}`);
   // Test-Trigger: ?simulate=down erzwingt einen Alarm (Alarm-Weg-Test).
   if (req.query?.simulate === "down") problems.push("TEST-ALARM (simulate=down) — kein echtes Problem, nur Alarm-Weg-Test.");
 
   // Alarm-Entprellung: Zustand kommt vom Aufrufer (GitHub-Action) via Query.
-  const fp = computeFingerprint({ ingestion, n8n, execErrors, replyGap, zernio }, problems.length > 0);
+  const fp = computeFingerprint({ ingestion, n8n, execErrors, replyGap, zernio, v2 }, problems.length > 0);
   const prev = typeof req.query?.prev === "string" ? req.query.prev : null;
   const alertedFp = typeof req.query?.alertedFp === "string" ? req.query.alertedFp : undefined;
   const sinceAlert = Number(req.query?.sinceAlert);

@@ -54,6 +54,31 @@
         "datenbankKey": "SUPABASE_SERVICE_ROLE_KEY"
       },
       "n8nUrl": "https://n8n.dimi-it.com"
+    },
+    {
+      "id": "tf-lead-funnel-v2-staging",
+      "anzeigename": "TF Lead-Funnel V2 (Staging)",
+      "v2Url": "https://tf-lead-funnel-v2-staging.vercel.app",
+      "kritischeWorkflows": [
+        {
+          "id": "v2-inbox",
+          "bezeichnung": "V2 Inbox-Dienst (Bereitschaft und Absicherung)"
+        }
+      ],
+      "pruefungen": [
+        "v2_bereitschaft"
+      ],
+      "alarm": {
+        "betreffProblem": "TF Lead-Funnel V2 (Staging): PROBLEM",
+        "betreffOk": "TF Lead-Funnel V2 (Staging): wieder OK",
+        "absender": "V2 Watchdog <onboarding@resend.dev>",
+        "email": [
+          "info+v2staging@vantixai.de"
+        ],
+        "telegramChatIds": []
+      },
+      "schwellen": {},
+      "secretRefs": {}
     }
   ]
 }

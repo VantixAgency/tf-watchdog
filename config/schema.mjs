@@ -13,6 +13,13 @@
 export const PRUEFUNGEN = [
   'n8n_erreichbar', 'workflow_fehler', 'ingestion', 'provider_webhook',
   'antwort_stau', 'queue_tiefe', 'link_erreichbarkeit',
+  // V2 laeuft nicht auf n8n, sondern als eigener Dienst. Der Melder fragt dessen
+  // Bereitschaftsendpunkt ab -- und zwar nicht nur "antwortet er", sondern auch, ob
+  // die Sicherheitsmerkmale noch stehen: alle Migrationen angewendet, keine Tabelle
+  // ohne RLS, echte Auth-Kette aktiv, Benutzerkontext verdrahtet. Ein Melder, der nur
+  // auf HTTP 200 prueft, wuerde eine stillschweigend abgeschaltete Absicherung
+  // durchgehen lassen.
+  'v2_bereitschaft',
 ];
 
 /** Grenzen fuer Schwellwerte. Schuetzt vor Konfigurationsfehlern, die Melder taub machen. */
@@ -26,6 +33,9 @@ export const GRENZEN = {
   ladeFensterMin:     { min: 5,  max: 1440, default: 25 },
   erinnerungSek:      { min: 300, max: 86400, default: 7200 },
 };
+
+/** Diese Pruefungen brauchen eine n8n-Instanz. Alle anderen kommen ohne aus. */
+export const BRAUCHT_N8N = ['n8n_erreichbar', 'workflow_fehler'];
 
 const istText = (v) => typeof v === 'string' && v.trim().length > 0;
 const istIdListe = (v) => Array.isArray(v) && v.every((x) => istText(x?.id) && istText(x?.bezeichnung));
@@ -44,6 +54,12 @@ export function pruefeOrganisation(org, index = 0) {
   if (!istText(org?.anzeigename)) f.push(`${wo('anzeigename')} fehlt`);
   if (org?.n8nUrl !== undefined && !/^https:\/\/[a-z0-9.-]+(\/|$)/i.test(String(org.n8nUrl)))
     f.push(`${wo('n8nUrl')} ist keine https-URL`);
+  if (org?.v2Url !== undefined && !/^https:\/\/[a-z0-9.-]+(\/|$)/i.test(String(org.v2Url)))
+    f.push(`${wo('v2Url')} ist keine https-URL`);
+  // Ein Melder ohne Ziel prueft nichts und meldet trotzdem "ok". Das ist der
+  // gefaehrlichste Zustand ueberhaupt, deshalb ist er ein Konfigurationsfehler.
+  if ((org?.pruefungen ?? []).includes('v2_bereitschaft') && !istText(org?.v2Url))
+    f.push(`${wo('v2Url')} fehlt, obwohl v2_bereitschaft geprueft werden soll`);
 
   if (!istIdListe(org?.kritischeWorkflows))
     f.push(`${wo('kritischeWorkflows')} muss eine Liste aus {id, bezeichnung} sein`);
