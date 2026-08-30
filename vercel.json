@@ -1,6 +1,7 @@
 {
   "$schema": "https://openapi.vercel.sh/vercel.json",
   "crons": [
-    { "path": "/api/check", "schedule": "0 8 * * *" }
+    { "path": "/api/check?org=tattoo-fashion", "schedule": "0 8 * * *" },
+    { "path": "/api/check?org=tf-lead-funnel-v2-staging", "schedule": "30 8 * * *" }
   ]
 }
