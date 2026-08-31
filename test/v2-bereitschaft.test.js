@@ -77,14 +77,32 @@ test('ein uebersprungener V2-Check gilt nicht als Problem', () => {
 // das leistet der Lauf gegen das echte Staging.
 
 /** Antwortet an Stelle des Netzes. So ist jeder Fall deterministisch. */
-const stub = (bereit, { gesund = { ok: true }, gesundStatus = 200, bereitStatus = 200 } = {}) =>
-  async (url) => String(url).endsWith('/api/gesund')
-    ? { status: gesundStatus, json: async () => gesund }
-    : { status: bereitStatus, json: async () => bereit };
+const stub = (bereit, { gesund = { ok: true }, gesundStatus = 200, bereitStatus = 200,
+                        betrieb = null, betriebStatus = 200 } = {}) =>
+  async (url) => {
+    const u = String(url);
+    if (u.endsWith('/api/gesund')) return { status: gesundStatus, json: async () => gesund };
+    if (u.endsWith('/api/betrieb')) return { status: betriebStatus, json: async () => (betrieb ?? BETRIEB) };
+    return { status: bereitStatus, json: async () => bereit };
+  };
 
 const GESUND = Object.freeze({ ok: true, migrationen: 20, tabellen: 31, tabellenOhneRls: 0,
                                auth: 'supabase', benutzerkontext: true });
-const ORG = { v2Url: 'https://beispiel.invalid' };
+
+/** Ein unauffaelliger Betriebsstand. Jeder Meldefall weicht davon in EINER Zahl ab. */
+const BETRIEB = Object.freeze({
+  migrationen: 32, letzteMigration: new Date().toISOString(), tabellen: 38, tabellenOhneRls: 0,
+  letzterEingang: new Date().toISOString(), letzteZustellung: new Date().toISOString(),
+  retryStau: 0, dlqTiefe: 0,
+  schatten: { gesamt24h: 0, laxer24h: 0, abweichungen24h: 0 },
+  kanaele: { gesamt: 3, fehlerhaft: 0 },
+  organisationen: 2, haengendeOnboardings: 0,
+});
+
+const ORG = { v2Url: 'https://beispiel.invalid', schwellen: {} };
+
+// Der Melder braucht ein Token, sonst meldet er (richtig) "ungeprueft".
+process.env.V2_BETRIEB_TOKEN = 'test-token';
 
 test('gesunder Dienst: kein Problem', async () => {
   const r = await checkV2Bereit(ORG, stub(GESUND));
@@ -152,4 +170,85 @@ test('die erwartete Migrationszahl steht NICHT in der Konfiguration', () => {
   // nachgezogen werden. Vergisst man das, meldet der Waechter Alarm ohne Anlass --
   // und man gewoehnt sich das Wegklicken an.
   assert.ok(!/migrationen/i.test(JSON.stringify(v2)), 'Migrationszahl in der Konfiguration gefunden');
+});
+
+// ── Betriebszahlen: der Unterschied zwischen "lebt" und "arbeitet" ──────────
+
+test('ohne Betriebstoken meldet der Melder AUSDRUECKLICH ungeprueft', async () => {
+  // Kein Token heisst nicht "alles gut". Ein halb verdrahteter Melder, der gruen
+  // meldet, ist schlimmer als gar keiner -- man verlaesst sich auf ihn.
+  const alt = process.env.V2_BETRIEB_TOKEN;
+  delete process.env.V2_BETRIEB_TOKEN;
+  const r = await checkV2Bereit(ORG, stub(GESUND));
+  process.env.V2_BETRIEB_TOKEN = alt;
+  assert.equal(r.ok, false);
+  assert.ok(r.problems.some((p) => /ungeprueft/.test(p)), r.problems.join(' | '));
+});
+
+test('ein Retry-Stau ueber der Schwelle ist ein Problem', async () => {
+  const r = await checkV2Bereit({ ...ORG, schwellen: { retryStau: 25 } },
+    stub(GESUND, { betrieb: { ...BETRIEB, retryStau: 40 } }));
+  assert.ok(r.problems.some((p) => /Retry-Stau: 40/.test(p)), r.problems.join(' | '));
+});
+
+test('ein Retry-Stau UNTER der Schwelle ist keiner', async () => {
+  // Die Flughoehe ist der Punkt: Ein einzelner Wiederholungsversuch ist normaler
+  // Betrieb. Ein Melder, der ab dem ersten feuert, wird weggeklickt.
+  const r = await checkV2Bereit({ ...ORG, schwellen: { retryStau: 25 } },
+    stub(GESUND, { betrieb: { ...BETRIEB, retryStau: 12 } }));
+  assert.deepEqual(r.problems, []);
+});
+
+test('eine zu tiefe DLQ ist ein Problem', async () => {
+  const r = await checkV2Bereit({ ...ORG, schwellen: { dlqTiefe: 10 } },
+    stub(GESUND, { betrieb: { ...BETRIEB, dlqTiefe: 11 } }));
+  assert.ok(r.problems.some((p) => /DLQ-Tiefe 11/.test(p)), r.problems.join(' | '));
+});
+
+test('im Schattenbetrieb alarmiert NUR die gefaehrliche Richtung', async () => {
+  // `v2_strenger` ist die gewollte Richtung. Beides in eine Zahl zu werfen haette
+  // den Melder bei jeder gewollten Verschaerfung rot gemacht.
+  const strenger = await checkV2Bereit(ORG,
+    stub(GESUND, { betrieb: { ...BETRIEB, schatten: { gesamt24h: 50, laxer24h: 0, abweichungen24h: 9 } } }));
+  assert.deepEqual(strenger.problems, [], strenger.problems.join(' | '));
+
+  const laxer = await checkV2Bereit(ORG,
+    stub(GESUND, { betrieb: { ...BETRIEB, schatten: { gesamt24h: 50, laxer24h: 1, abweichungen24h: 9 } } }));
+  assert.ok(laxer.problems.some((p) => /LAXER/.test(p)), laxer.problems.join(' | '));
+});
+
+test('ein fehlerhafter Kanal ist ein Problem', async () => {
+  const r = await checkV2Bereit(ORG,
+    stub(GESUND, { betrieb: { ...BETRIEB, kanaele: { gesamt: 3, fehlerhaft: 1 } } }));
+  assert.ok(r.problems.some((p) => /1 von 3 Kanaelen/.test(p)), r.problems.join(' | '));
+});
+
+test('Stille im Eingang meldet nur, wenn eine Schwelle gesetzt ist', async () => {
+  // In Staging kommt tagelang nichts an. Ohne diese Unterscheidung waere der
+  // Staging-Melder dauerhaft rot -- und damit wertlos.
+  const lange = new Date(Date.now() - 5 * 3600 * 1000).toISOString();
+  const ohne = await checkV2Bereit(ORG, stub(GESUND, { betrieb: { ...BETRIEB, letzterEingang: lange } }));
+  assert.deepEqual(ohne.problems, []);
+
+  const mit = await checkV2Bereit({ ...ORG, schwellen: { eingangStilleMin: 60 } },
+    stub(GESUND, { betrieb: { ...BETRIEB, letzterEingang: lange } }));
+  assert.ok(mit.problems.some((p) => /kein eingehendes Ereignis/.test(p)), mit.problems.join(' | '));
+});
+
+test('ein haengendes Onboarding ist ein Problem', async () => {
+  const r = await checkV2Bereit(ORG, stub(GESUND, { betrieb: { ...BETRIEB, haengendeOnboardings: 2 } }));
+  assert.ok(r.problems.some((p) => /Onboarding-Sitzung/.test(p)), r.problems.join(' | '));
+});
+
+test('nicht abrufbare Betriebszahlen sind ein Problem, kein stilles Gruen', async () => {
+  const r = await checkV2Bereit(ORG, stub(GESUND, { betriebStatus: 401 }));
+  assert.ok(r.problems.some((p) => /nicht abrufbar \(Status 401\)/.test(p)), r.problems.join(' | '));
+});
+
+test('die Staging-Konfiguration setzt bewusst KEINE Stilleschwellen', () => {
+  assert.equal(Number(v2.schwellen.eingangStilleMin), 0);
+  assert.equal(Number(v2.schwellen.zustellungStilleMin), 0);
+  assert.ok(Number(v2.schwellen.retryStau) > 0, 'Stau und DLQ haben sehr wohl Schwellen');
+  assert.ok(Number(v2.schwellen.dlqTiefe) > 0);
+  assert.equal(v2.secretRefs.betriebToken, 'V2_BETRIEB_TOKEN');
 });

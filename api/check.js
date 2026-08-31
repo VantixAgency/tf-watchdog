@@ -563,7 +563,76 @@ export async function checkV2Bereit(org, holen = fetch) {
     problems.push(`Auth-Kette ist "${b.auth}" statt "supabase" — der Dienst laeuft auf einem Ersatzadapter`);
   if (b.benutzerkontext !== true)
     problems.push("Benutzerkontext nicht verdrahtet — Zugriffe liefen privilegiert an RLS vorbei");
-  return { ok: problems.length === 0, problems, bereit: b, gesund: gesund?.body ?? null };
+
+  // ── Betriebszahlen ────────────────────────────────────────────────────────
+  //
+  // `/api/bereit` sagt, dass der Dienst LEBT. Es sagt nicht, ob er ARBEITET.
+  // Genau dieser Unterschied war der 13-Tage-Ausfall: Der Dienst antwortete die
+  // ganze Zeit mit 200, waehrend seit knapp zwei Wochen keine Nachricht mehr ankam.
+  //
+  // Die Zahlen kommen ueber einen eigenen, tokengeschuetzten Endpunkt -- der
+  // Watchdog bekommt bewusst KEINEN Datenbankzugang. Ein zweites Repository mit
+  // service_role waere fuer eine Handvoll Zaehler ein zu hoher Preis.
+  const token = process.env[org?.secretRefs?.betriebToken || "V2_BETRIEB_TOKEN"];
+  let betrieb = null;
+  if (!token) {
+    // Kein Token heisst NICHT "alles gut". Es heisst "ungeprueft", und das gehoert
+    // in den Bericht -- sonst sieht ein halb verdrahteter Melder aus wie ein gruener.
+    problems.push("Betriebszahlen ungeprueft: kein V2_BETRIEB_TOKEN gesetzt");
+  } else {
+    try {
+      betrieb = await withTimeout(async (signal) => {
+        const a = await holen(`${basis}/api/betrieb`, { signal, headers: { "x-betrieb-token": token } });
+        return { status: a.status, body: await a.json().catch(() => ({})) };
+      }, 10000);
+      if (betrieb.status !== 200) {
+        problems.push(`Betriebszahlen nicht abrufbar (Status ${betrieb.status})`);
+      } else {
+        const d = betrieb.body || {};
+        const s = org?.schwellen || {};
+        const altMin = (wert) => (wert ? Math.round((Date.now() - Date.parse(wert)) / 60000) : null);
+
+        // Stille im Eingang. Die Schwelle ist bewusst grosszuegig und je Installation
+        // einstellbar: In Staging kommt tagelang nichts an, und ein Melder, der
+        // deshalb dauernd rot ist, wird abgeschaltet.
+        const eingangMin = altMin(d.letzterEingang);
+        const eingangGrenze = Number(s.eingangStilleMin ?? 0);
+        if (eingangGrenze > 0 && eingangMin !== null && eingangMin > eingangGrenze)
+          problems.push(`seit ${eingangMin} Min kein eingehendes Ereignis (Grenze ${eingangGrenze})`);
+
+        const zustellungMin = altMin(d.letzteZustellung);
+        const zustellungGrenze = Number(s.zustellungStilleMin ?? 0);
+        if (zustellungGrenze > 0 && zustellungMin !== null && zustellungMin > zustellungGrenze)
+          problems.push(`seit ${zustellungMin} Min keine Zustellung (Grenze ${zustellungGrenze})`);
+
+        // Stau und DLQ: hier zaehlt die HOEHE, nicht das erste Vorkommnis.
+        const stauGrenze = Number(s.retryStau ?? 25);
+        if (Number(d.retryStau) > stauGrenze)
+          problems.push(`Retry-Stau: ${d.retryStau} Ereignisse warten auf Wiederholung (Grenze ${stauGrenze})`);
+        const dlqGrenze = Number(s.dlqTiefe ?? 10);
+        if (Number(d.dlqTiefe) > dlqGrenze)
+          problems.push(`DLQ-Tiefe ${d.dlqTiefe} (Grenze ${dlqGrenze}) — Nachrichten liegen unzugestellt`);
+
+        // Schattenbetrieb: NUR die gefaehrliche Richtung alarmiert. `v2_strenger`
+        // ist die gewollte Richtung, und ein Melder, der bei gewolltem Verhalten
+        // rot wird, wird bald ignoriert.
+        const laxerGrenze = Number(s.schattenLaxer ?? 0);
+        if (Number(d.schatten?.laxer24h ?? 0) > laxerGrenze)
+          problems.push(`Schattenbetrieb: ${d.schatten.laxer24h} Faelle, in denen V2 LAXER war als der Bestand`);
+
+        if (Number(d.kanaele?.fehlerhaft ?? 0) > 0)
+          problems.push(`${d.kanaele.fehlerhaft} von ${d.kanaele.gesamt} Kanaelen fehlerhaft oder ohne Autorisierung`);
+
+        if (Number(d.haengendeOnboardings ?? 0) > 0)
+          problems.push(`${d.haengendeOnboardings} Onboarding-Sitzung(en) seit ueber 14 Tagen offen`);
+      }
+    } catch (e) {
+      problems.push(`Betriebszahlen nicht abrufbar (${String(e.message).slice(0, 80)})`);
+    }
+  }
+
+  return { ok: problems.length === 0, problems, bereit: b,
+           gesund: gesund?.body ?? null, betrieb: betrieb?.body ?? null };
 }
 
 export default async function handler(req, res) {

@@ -77,8 +77,21 @@
         ],
         "telegramChatIds": []
       },
-      "schwellen": {},
-      "secretRefs": {}
+      "schwellen": {
+        "$kommentar": [
+          "Staging bekommt bewusst KEINE Stilleschwellen: Dort kommt tagelang nichts an, und ein Melder, der deshalb dauernd rot ist, wird abgeschaltet. Eine produktive Installation setzt eingangStilleMin und zustellungStilleMin.",
+          "schattenLaxer bleibt bei 0, auch in Staging. Ein Fall, in dem V2 gesendet haette waehrend der Bestand blockierte, ist die einzige Abweichungsrichtung, die eine falsche Nachricht an einen Kunden erzeugen kann -- dafuer gibt es keine vertretbare Toleranz.",
+          "Folge: Nach einem Schatten-Abnahmelauf ist dieser Melder fuer 24 Stunden rot, weil der Lauf absichtlich je einen Fall pro Richtung erzeugt. Das ist der Melder bei der Arbeit, kein Rauschen -- und es ist der Grund, warum Staging einen EIGENEN Alarmempfaenger hat."
+        ],
+        "eingangStilleMin": 0,
+        "zustellungStilleMin": 0,
+        "retryStau": 25,
+        "dlqTiefe": 10,
+        "schattenLaxer": 0
+      },
+      "secretRefs": {
+        "betriebToken": "V2_BETRIEB_TOKEN"
+      }
     }
   ]
 }
