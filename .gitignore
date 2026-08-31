@@ -5,3 +5,4 @@
 # reinen Node-Codes in n8n/health-check.live.js — der enthaelt nur $env-Namen.
 n8n-backup/
 .env.wd.local
+.env*.local
