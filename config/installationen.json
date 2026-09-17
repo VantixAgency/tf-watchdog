@@ -31,7 +31,12 @@
         "workflow_fehler",
         "ingestion",
         "provider_webhook",
-        "antwort_stau"
+        "antwort_stau",
+        "kanal_wirkung"
+      ],
+      "kanaele": [
+        "instagram",
+        "whatsapp"
       ],
       "provider": {
         "art": "zernio",

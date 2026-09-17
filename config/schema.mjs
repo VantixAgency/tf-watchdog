@@ -20,6 +20,11 @@ export const PRUEFUNGEN = [
   // auf HTTP 200 prueft, wuerde eine stillschweigend abgeschaltete Absicherung
   // durchgehen lassen.
   'v2_bereitschaft',
+  // Misst je Studio UND Kanal, ob wirklich geantwortet wird — nicht nur, ob die
+  // Anlage lebt. Ohne diese Pruefung bleibt der haeufigste Ausfall unsichtbar:
+  // ein einzelner Kanal steht, waehrend alle anderen Melder gruen sind, weil die
+  // anderen Kanaele weiterlaufen (Vorfall WhatsApp Muenchen, 17.09.2026).
+  'kanal_wirkung',
 ];
 
 /** Grenzen fuer Schwellwerte. Schuetzt vor Konfigurationsfehlern, die Melder taub machen. */
@@ -32,7 +37,16 @@ export const GRENZEN = {
   stauHartMin:        { min: 5,  max: 1440, default: 60 },
   ladeFensterMin:     { min: 5,  max: 1440, default: 25 },
   erinnerungSek:      { min: 300, max: 86400, default: 7200 },
+  // Kanal-Wirkung. Die Obergrenzen sind bewusst eng: ein Fenster von Tagen oder eine
+  // Mindestmenge von Hunderten machen den Melder faktisch taub, ohne ihn abzuschalten —
+  // und ein tauber Melder, der gruen leuchtet, ist genau der Zustand vom 17.09.2026.
+  wirkungFensterMin:     { min: 30, max: 720, default: 180 },
+  wirkungMindestEingang: { min: 3,  max: 50,  default: 5 },
+  wirkungPausenAnteil:   { min: 50, max: 100, default: 70 },
 };
+
+/** Kanaele, die ueberwacht werden duerfen. Keine freien Werte — der Name geht direkt in eine Abfrage. */
+export const KANAELE = ['instagram', 'whatsapp'];
 
 /** Diese Pruefungen brauchen eine n8n-Instanz. Alle anderen kommen ohne aus. */
 export const BRAUCHT_N8N = ['n8n_erreichbar', 'workflow_fehler'];
@@ -60,6 +74,17 @@ export function pruefeOrganisation(org, index = 0) {
   // gefaehrlichste Zustand ueberhaupt, deshalb ist er ein Konfigurationsfehler.
   if ((org?.pruefungen ?? []).includes('v2_bereitschaft') && !istText(org?.v2Url))
     f.push(`${wo('v2Url')} fehlt, obwohl v2_bereitschaft geprueft werden soll`);
+
+  // Kanalliste: nur bekannte Werte. Der Kanalname wird in eine PostgREST-Abfrage
+  // eingesetzt; ein freier Wert waere eine offene Tuer und ein stiller Fehlmelder.
+  if (org?.kanaele !== undefined) {
+    if (!Array.isArray(org.kanaele) || org.kanaele.length === 0)
+      f.push(`${wo('kanaele')} muss eine nicht-leere Liste sein`);
+    else for (const k of org.kanaele)
+      if (!KANAELE.includes(k)) f.push(`${wo('kanaele')}: "${k}" ist kein bekannter Kanal`);
+  }
+  if ((org?.pruefungen ?? []).includes('kanal_wirkung') && org?.kanaele === undefined)
+    f.push(`${wo('kanaele')} fehlt, obwohl kanal_wirkung geprueft werden soll — sonst raet der Melder, welche Kanaele es gibt`);
 
   if (!istIdListe(org?.kritischeWorkflows))
     f.push(`${wo('kritischeWorkflows')} muss eine Liste aus {id, bezeichnung} sein`);

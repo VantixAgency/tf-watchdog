@@ -1,5 +1,10 @@
 {
   "$schema": "https://openapi.vercel.sh/vercel.json",
+  "functions": {
+    "api/check.js": {
+      "maxDuration": 60
+    }
+  },
   "crons": [
     { "path": "/api/check?org=tattoo-fashion", "schedule": "0 8 * * *" },
     { "path": "/api/check?org=tf-lead-funnel-v2-staging", "schedule": "30 8 * * *" }

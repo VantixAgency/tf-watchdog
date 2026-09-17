@@ -3,9 +3,19 @@
 // Welche Workflows, Empfänger, Schwellen und Anbieter das sind, steht NICHT hier,
 // sondern in config/installationen.json — je Organisation (G4).
 //   1) Ist n8n überhaupt erreichbar?
-//   2) Erroren die kritischen Workflows? (n8n Executions API)  ← NEU, Hauptschutz
-//   3) Kommen DMs rein, aber es geht KEINE Antwort raus? (Supabase, optional)  ← NEU
+//   2) Erroren die kritischen Workflows? (n8n Executions API)
+//   3) Kommen DMs rein, aber es geht KEINE Antwort raus? (Supabase, optional)
+//   4) ARBEITET jeder Kanal, oder nimmt er nur an? (je Studio × Kanal)  ← NEU 17.09.2026
 // Alarmiert per Resend-Email + optional Telegram.
+//
+// WARUM 4 DAZUKAM (Vorfall 2026-09-17): WhatsApp München antwortete nicht mehr —
+// 17 Kundennachrichten zwischen 10 und 14 Uhr, keine einzige KI-Antwort, das Team
+// fing 11 von Hand ab. Der Watchdog meldete in den 30 Stunden davor 272-mal "OK".
+// Grund: Jede einzelne Prüfung war kanalblind. Der Ingestion-Check fragte global
+// "kam irgendwo etwas an?" (Instagram lief → grün), der Reply-Gap-Check filtert
+// pausierte Chats weg (und Übernahme pausiert dauerhaft → grün), der Zernio-Check
+// prüft einen Webhook für alle Kanäle (→ grün). Keiner verglich Eingang gegen
+// Antwort. Prüfung 4 tut genau das, getrennt je Studio und Kanal.
 //
 // WARUM NEU (Incident 2026-07-08): Die alte Version prüfte nur n8n-Erreichbarkeit.
 // n8n war erreichbar (200), aber der Poll-Workflow "KI-Trigger-Poll" crashte
@@ -42,6 +52,7 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { pruefeKonfiguration, mitVorgaben, BRAUCHT_N8N } from "../config/schema.mjs";
+import { kanalWirkungVerdict, kanalQueries } from "./kanal-wirkung.mjs";
 
 const HIER = dirname(fileURLToPath(import.meta.url));
 
@@ -137,7 +148,18 @@ async function checkExecutionErrors(n8nUrl, org) {
         `${n8nUrl.replace(/\/$/, "")}/api/v1/executions?status=error&limit=100&includeData=false`,
         { signal, headers: { "X-N8N-API-KEY": apiKey, accept: "application/json" } }
       ), 12000);
-    if (!res.ok) return { skipped: false, ok: true, note: `Executions-API HTTP ${res.status}` };
+    // FIX 17.09.2026: Ein abgelehnter Zugang ist KEINE Gesundheit.
+    // Vorher gab jeder Nicht-200-Status `ok: true` zurueck — auch ein 401. Der n8n-
+    // API-Key laeuft periodisch ab (zuletzt 05.06.2026); ab da haette dieser Melder
+    // still "alles gut" gesagt, ohne je eine Execution gesehen zu haben. Ein Melder,
+    // der nicht hineinschauen kann, muss das SAGEN, nicht schweigen.
+    if (res.status === 401 || res.status === 403) {
+      return { skipped: false, ok: false, blind: true,
+               note: `Executions-API lehnt den Zugang ab (HTTP ${res.status}) — n8n-API-Key abgelaufen oder ungueltig. Dieser Melder prueft derzeit NICHTS.` };
+    }
+    // Andere Fehler (5xx, Rate-Limit) sind fremde Stoerungen: nicht alarmieren, aber
+    // auch nicht als geprueft ausgeben.
+    if (!res.ok) return { skipped: false, ok: true, ungeprueft: true, note: `Executions-API HTTP ${res.status}` };
     const data = await res.json();
     const rows = Array.isArray(data?.data) ? data.data : [];
     const counts = {};
@@ -191,7 +213,7 @@ export function ingestionVerdict(lastMs, nowMs, opts = {}) {
   };
 }
 
-async function checkIngestion(org) {
+export async function checkIngestion(org) {
   // G4: Datenbankzugang je Organisation. Ohne das laese der Melder einer Organisation
   // in der Datenbank einer anderen -- Cross-Tenant-Datenzugriff.
   const url = process.env[org?.secretRefs?.datenbankUrl || "SUPABASE_URL"];
@@ -199,25 +221,57 @@ async function checkIngestion(org) {
   if (!url || !key) return { skipped: true, reason: "SUPABASE_SERVICE_KEY nicht gesetzt" };
   const base = url.replace(/\/$/, "");
   const headers = { apikey: key, Authorization: `Bearer ${key}` };
+  const kanaeleListe = org?.kanaele?.length ? org.kanaele : ["instagram", "whatsapp"];
   try {
-    const res = await withTimeout(
-      (signal) => fetch(
-        `${base}/rest/v1/messages?select=created_at&direction=eq.in&order=created_at.desc&limit=1`,
-        { signal, headers }
-      ), 10000);
-    if (!res.ok) return { skipped: false, ok: true, note: `Ingestion-Check HTTP ${res.status}` };
-    const rows = await res.json();
-    const last = rows?.[0]?.created_at ? new Date(rows[0].created_at) : null;
-    if (!last) return { skipped: false, ok: false, reason: "keine eingehenden Nachrichten in DB" };
-    const verdict = ingestionVerdict(last.getTime(), Date.now());
+    // FIX 17.09.2026: je Studio UND Kanal, nicht global.
+    // Vorher stand hier EINE Abfrage ohne jeden Filter: "wann kam irgendwo die letzte
+    // eingehende Nachricht an?". Eine einzige Instagram-Nachricht aus Landshut hielt
+    // den Melder gruen — WhatsApp Muenchen haette wochenlang tot sein koennen, ohne
+    // dass diese Zahl sich bewegt. Genau das ist am 17.09. passiert.
+    const accRes = await withTimeout(
+      (signal) => fetch(`${base}/rest/v1/accounts?select=id,slug`, { signal, headers }), 10000);
+    if (!accRes.ok) return { skipped: false, ok: true, ungeprueft: true, note: `Accounts-Abfrage HTTP ${accRes.status}` };
+    const accounts = await accRes.json();
+    if (!Array.isArray(accounts) || accounts.length === 0)
+      return { skipped: false, ok: false, reason: "keine Accounts in DB", tote: [], kanaele: [] };
+
+    const paare = [];
+    for (const a of accounts) for (const pl of kanaeleListe) paare.push({ a, pl });
+
+    const kanaele = await Promise.all(paare.map(async ({ a, pl }) => {
+      const name = `${a.slug || a.id}/${pl}`;
+      const q = `${base}/rest/v1/messages?select=created_at&direction=eq.in&source=eq.customer` +
+                `&account_id=eq.${a.id}&chats!inner(platform)&chats.platform=eq.${pl}` +
+                `&order=created_at.desc&limit=1`;
+      const res = await withTimeout((signal) => fetch(q, { signal, headers }), 10000);
+      if (!res.ok) return { kanal: name, ungeprueft: true, note: `HTTP ${res.status}` };
+      const rows = await res.json();
+      const last = rows?.[0]?.created_at ? new Date(rows[0].created_at) : null;
+      // Ein Kanal, der noch nie etwas empfangen hat, ist nicht tot — er ist neu.
+      // Ihn als Ausfall zu melden waere ein Dauerfehlalarm bis zur ersten Nachricht.
+      if (!last) return { kanal: name, nieEmpfangen: true };
+      const v = ingestionVerdict(last.getTime(), Date.now(), { staleH: org?.schwellen?.ingestStaleStunden });
+      return { kanal: name, lastInbound: last.toISOString(), ...v };
+    }));
+
+    const tote = kanaele.filter((k) => k.dead);
+    // `dead`/`ageHours` bleiben als Gesamtbild erhalten, damit bestehende Auswertungen
+    // und die Entwarnungsmail weiterlaufen.
+    const juengste = kanaele.filter((k) => k.lastInbound)
+      .sort((a, b) => Date.parse(b.lastInbound) - Date.parse(a.lastInbound))[0];
     return {
       skipped: false,
-      ok: !verdict.dead,
-      lastInbound: last.toISOString(),
-      ...verdict,
+      ok: tote.length === 0,
+      kanaele,
+      tote,
+      dead: tote.length > 0,
+      lastInbound: juengste?.lastInbound || null,
+      ageHours: juengste?.ageHours ?? null,
+      staleThresholdH: kanaele.find((k) => k.staleThresholdH)?.staleThresholdH ?? null,
+      reason: tote.length ? tote.map((t) => `${t.kanal}: ${t.reason}`).join("; ") : null,
     };
   } catch (e) {
-    return { skipped: false, ok: true, note: "Ingestion-Check fehlgeschlagen: " + String(e).slice(0, 100) };
+    return { skipped: false, ok: true, ungeprueft: true, note: "Ingestion-Check fehlgeschlagen: " + String(e).slice(0, 100) };
   }
 }
 
@@ -402,6 +456,80 @@ async function checkReplyGap(org) {
   }
 }
 
+// ---- Kanal-Wirkung: arbeitet jeder Kanal, oder nimmt er nur an? -------------
+// Der Melder, der am 17.09.2026 gefehlt hat. Begruendung, Schwellen und Testfaelle
+// stehen in ./kanal-wirkung.mjs — hier steht nur die Datenbeschaffung.
+//
+// Kosten: 2 Studios x 2 Kanaele x 4 Abfragen + 1 Accounts-Abfrage. Alle Zaehlungen
+// laufen als HEAD-artige count-Abfragen (Range 0-0), es werden also keine Zeilen
+// uebertragen, und alles parallel.
+export async function checkKanalWirkung(org) {
+  const url = process.env[org?.secretRefs?.datenbankUrl || "SUPABASE_URL"];
+  const key = process.env.SUPABASE_SERVICE_KEY;
+  if (!url || !key) return { skipped: true, reason: "SUPABASE_SERVICE_KEY nicht gesetzt" };
+
+  const base = url.replace(/\/$/, "");
+  const headers = { apikey: key, Authorization: `Bearer ${key}` };
+  const zaehlKopf = { ...headers, Prefer: "count=exact", Range: "0-0", "Range-Unit": "items" };
+  const fensterMin = Number(org?.schwellen?.wirkungFensterMin ?? 180);
+  const seitIso = new Date(Date.now() - fensterMin * 60000).toISOString();
+  const kanaeleListe = org?.kanaele?.length ? org.kanaele : ["instagram", "whatsapp"];
+
+  const zaehle = async (pfad) => {
+    const res = await withTimeout((signal) => fetch(`${base}/rest/v1/${pfad}`, { signal, headers: zaehlKopf }), 10000);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const cr = res.headers.get("content-range") || "";
+    const n = parseInt(cr.split("/")[1], 10);
+    return Number.isFinite(n) ? n : 0;
+  };
+
+  try {
+    const accRes = await withTimeout(
+      (signal) => fetch(`${base}/rest/v1/accounts?select=id,slug`, { signal, headers }), 10000);
+    if (!accRes.ok) return { skipped: false, ok: true, ungeprueft: true, note: `Accounts-Abfrage HTTP ${accRes.status}` };
+    const accounts = await accRes.json();
+    if (!Array.isArray(accounts) || accounts.length === 0)
+      return { skipped: false, ok: false, note: "keine Accounts in der Datenbank gefunden" };
+
+    const paare = [];
+    for (const a of accounts) for (const pl of kanaeleListe) paare.push({ a, pl });
+
+    const kanaele = await Promise.all(paare.map(async ({ a, pl }) => {
+      const q = kanalQueries({ accountId: a.id, platform: pl, seitIso });
+      const [eingang, kiAntworten, manuelleAntworten, chatsRes] = await Promise.all([
+        zaehle(q.eingang),
+        zaehle(q.kiAntworten),
+        zaehle(q.manuelleAntworten),
+        withTimeout((signal) => fetch(`${base}/rest/v1/${q.chats}`, { signal, headers }), 10000)
+          .then((r) => (r.ok ? r.json() : [])),
+      ]);
+      const chats = Array.isArray(chatsRes) ? chatsRes : [];
+      return {
+        studio: a.slug || a.id,
+        kanal: pl,
+        eingang,
+        kiAntworten,
+        manuelleAntworten,
+        chatsMitEingang: chats.length,
+        // ai_enabled=false ist eine bewusste Abschaltung durch das Studio und zaehlt
+        // wie eine Pause: die KI ist in diesem Chat aus, egal aus welchem Grund.
+        davonPausiert: chats.filter((c) => c.ai_paused === true || c.ai_enabled === false).length,
+      };
+    }));
+
+    const verdict = kanalWirkungVerdict(kanaele, {
+      fensterMin,
+      mindestEingang: org?.schwellen?.wirkungMindestEingang,
+      pausenAnteilProzent: org?.schwellen?.wirkungPausenAnteil,
+    });
+    return { skipped: false, fensterMin, seit: seitIso, ...verdict };
+  } catch (e) {
+    // Eine gescheiterte Abfrage darf nicht dauer-alarmieren, aber auch nicht als
+    // "geprueft und gesund" durchgehen.
+    return { skipped: false, ok: true, ungeprueft: true, note: "Kanal-Wirkung nicht messbar: " + String(e).slice(0, 100) };
+  }
+}
+
 // ---- Alarm-Entprellung (Anti-Spam) -----------------------------------------
 // Problem: früher mailte JEDER Check, der ein Problem sah. Ein Reply-Gap, der
 // 100 Min anhält, erzeugte bei 5-Min-Takt ~20 identische Mails (Incident
@@ -413,9 +541,13 @@ async function checkReplyGap(org) {
 
 // Stabiler Fingerprint NUR aus Zustands-Flags — bewusst OHNE Minutenzahlen,
 // damit er sich nicht bei jedem Ping ändert, solange dasselbe Problem anhält.
-export function computeFingerprint({ ingestion, n8n, execErrors, replyGap, zernio, v2 }, hasProblems) {
+export function computeFingerprint({ ingestion, n8n, execErrors, replyGap, zernio, v2, kanalWirkung }, hasProblems) {
   if (!hasProblems) return "OK";
   const offenders = (execErrors?.offenders || []).map((o) => o.workflowId).sort().join(",");
+  // Kanal + Art, aber ohne Zahlen: der Abdruck darf sich nicht bei jedem Ping aendern,
+  // solange derselbe Kanal aus demselben Grund steht — sonst mailt die Entprellung nie.
+  const kanaele = (kanalWirkung?.befunde || [])
+    .map((b) => `${b.kanal}:${b.art}`).sort().join(",");
   return [
     `ing:${!!ingestion?.dead || ingestion?.reason === "keine eingehenden Nachrichten in DB"}`,
     `n8n:${!n8n?.ok}`,
@@ -429,6 +561,12 @@ export function computeFingerprint({ ingestion, n8n, execErrors, replyGap, zerni
     // ausserdem denselben Abdruck tragen wie ein n8n-Ausfall -- die Entprellung
     // haette dann den zweiten Alarm als Wiederholung des ersten verschluckt.
     `v2:${v2?.ok === false}`,
+    // Ohne eigenen Abdruck traege ein stummer Kanal denselben wie ein n8n-Ausfall —
+    // die Entprellung haette den zweiten Alarm als Wiederholung des ersten geschluckt.
+    `kanal:${kanaele}`,
+    // Ein Melder, der wegen eines abgelaufenen Schluessels nichts sieht, ist ein
+    // eigener Zustand und keine Wiederholung des Problems, das er nicht sehen kann.
+    `blind:${execErrors?.blind === true}`,
   ].join("|");
 }
 
@@ -460,8 +598,15 @@ export function decideAlert({ hasProblems, fp, prev, alertedFp, sinceAlert, remi
 // Eine Alarm-Mail ohne nächsten Schritt ist nur Beunruhigung. Pro erkanntem
 // Problem genau eine Zeile, was jetzt zu tun ist — in der Reihenfolge, in der man
 // es abarbeiten würde (Ursache vor Symptom).
-function naechsteSchritte({ zernio, ingestion, n8n, execErrors, replyGap }) {
+function naechsteSchritte({ zernio, ingestion, n8n, execErrors, replyGap, kanalWirkung }) {
   const s = [];
+  for (const b of kanalWirkung?.befunde || []) {
+    if (b.art === 'pausenwelle') {
+      s.push(`→ ${b.kanal}: Im Dashboard die betroffenen Chats öffnen und "KI wieder aktivieren" klicken. Der globale KI-Schalter hebt eine Chat-Pause NICHT auf — aus- und wieder einschalten hilft hier nicht.`);
+    } else {
+      s.push(`→ ${b.kanal}: Zuerst prüfen, ob die Chats auf "KI pausiert" stehen (Übernahme durch das Team pausiert dauerhaft). Dann den Kanal-Eintrag in account_channels prüfen — fehlt er, antwortet der Outbound mit 500 und schreibt kein Event.`);
+    }
+  }
   if (zernio?.ok === false) {
     s.push("→ Zernio-Dashboard: Webhook wieder aktivieren. Er ist die Quelle — solange er aus ist, hilft alles andere nichts.");
   }
@@ -671,25 +816,33 @@ export default async function handler(req, res) {
   const brauchtN8n = (org.pruefungen || []).some((p) => BRAUCHT_N8N.includes(p));
   if (brauchtN8n && !n8nUrl)
     return res.status(500).json({ error: "config-invalid", detail: "n8nUrl fehlt fuer " + org.id });
-  const [n8n, execErrors, ingestion, replyGap, zernio, v2] = await Promise.all([
+  const [n8n, execErrors, ingestion, replyGap, zernio, v2, kanalWirkung] = await Promise.all([
     aktiv("n8n_erreichbar")  ? checkN8n(n8nUrl)                 : { skipped: true, reason: "nicht konfiguriert" },
     aktiv("workflow_fehler") ? checkExecutionErrors(n8nUrl, org) : { skipped: true, reason: "nicht konfiguriert" },
     aktiv("ingestion")       ? checkIngestion(org)               : { skipped: true, reason: "nicht konfiguriert" },
     aktiv("antwort_stau")    ? checkReplyGap(org)                : { skipped: true, reason: "nicht konfiguriert" },
     aktiv("provider_webhook")? checkZernio(org)                  : { skipped: true, reason: "nicht konfiguriert" },
     aktiv("v2_bereitschaft") ? checkV2Bereit(org)                : { skipped: true, reason: "nicht konfiguriert" },
+    aktiv("kanal_wirkung")   ? checkKanalWirkung(org)            : { skipped: true, reason: "nicht konfiguriert" },
   ]);
 
   const problems = [];
   // Zernio zuerst: die einzige Auskunft, die kein Rückschluss ist. Sagt Zernio
   // "Webhook aus", ist die Ursache damit benannt, nicht nur das Symptom.
   for (const p of zernio.problems || []) problems.push(`ZERNIO: ${p}`);
-  // Dann die Stille — der gefährlichste, weil komplett lautlose Ausfall.
-  if (ingestion.dead) {
-    problems.push(`INGESTION TOT: seit ${ingestion.ageHours}h keine eingehende DM in der DB (letzte ${ingestion.lastInbound}) — ${ingestion.reason}. Zernio→n8n liefert nicht — Instagram-DMs werden NICHT verarbeitet.`);
+  // Der wichtigste Melder zuerst nach Zernio: arbeitet der Kanal, oder nimmt er nur an?
+  // Das ist die Frage, die am 17.09.2026 niemand gestellt hat.
+  for (const b of kanalWirkung.befunde || []) problems.push(`KANAL STUMM — ${b.text}`);
+  // Dann die Stille — der gefährlichste, weil komplett lautlose Ausfall. Je Kanal.
+  for (const t of ingestion.tote || []) {
+    problems.push(`INGESTION TOT (${t.kanal}): seit ${t.ageHours}h keine eingehende Kundennachricht (letzte ${t.lastInbound}) — auf diesem Kanal kommt nichts mehr an.`);
   }
-  if (ingestion.reason === "keine eingehenden Nachrichten in DB") {
-    problems.push("INGESTION: keine eingehenden Nachrichten in der DB gefunden — Pipeline prüfen.");
+  if (ingestion.reason === "keine Accounts in DB") {
+    problems.push("INGESTION: keine Accounts in der Datenbank gefunden — Pipeline oder Zugang prüfen.");
+  }
+  // Ein Melder, der wegen eines abgelaufenen Schlüssels nichts sieht, muss das sagen.
+  if (execErrors.blind) {
+    problems.push(`MELDER BLIND: ${execErrors.note}`);
   }
   if (!n8n.ok) {
     problems.push(`n8n NICHT erreichbar (${n8nUrl}) — Status ${n8n.status}${n8n.error ? " / " + n8n.error : ""}`);
@@ -712,7 +865,7 @@ export default async function handler(req, res) {
   if (req.query?.simulate === "down") problems.push("TEST-ALARM (simulate=down) — kein echtes Problem, nur Alarm-Weg-Test.");
 
   // Alarm-Entprellung: Zustand kommt vom Aufrufer (GitHub-Action) via Query.
-  const fp = computeFingerprint({ ingestion, n8n, execErrors, replyGap, zernio, v2 }, problems.length > 0);
+  const fp = computeFingerprint({ ingestion, n8n, execErrors, replyGap, zernio, v2, kanalWirkung }, problems.length > 0);
   const prev = typeof req.query?.prev === "string" ? req.query.prev : null;
   const alertedFp = typeof req.query?.alertedFp === "string" ? req.query.alertedFp : undefined;
   const sinceAlert = Number(req.query?.sinceAlert);
@@ -737,7 +890,7 @@ export default async function handler(req, res) {
       ...problems.map((p) => "• " + p),
       "",
       "Was zu tun ist:",
-      ...naechsteSchritte({ zernio, ingestion, n8n, execErrors, replyGap }),
+      ...naechsteSchritte({ zernio, ingestion, n8n, execErrors, replyGap, kanalWirkung }),
       "",
       `Zeit: ${new Date().toISOString()}`,
       "(Gemeldet wird erst, wenn ein Problem zweimal hintereinander auftaucht — diese",
@@ -763,6 +916,7 @@ export default async function handler(req, res) {
 
   return res.status(200).json({
     checkedAt: new Date().toISOString(),
+    kanalWirkung,
     n8n,
     executionErrors: execErrors,
     ingestion,

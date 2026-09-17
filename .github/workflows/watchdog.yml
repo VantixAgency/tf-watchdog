@@ -9,7 +9,18 @@ name: TF Watchdog 5-min ping
 on:
   workflow_dispatch: {}
   schedule:
-    - cron: "0 */6 * * *"
+    # Stuendlich statt alle 6 Stunden (Fix 17.09.2026).
+    # Der 6h-Takt war als Sicherheitsnetz gedacht, falls die Self-Chain abreisst.
+    # Genau das ist passiert: Der Lauf vom 17.09. endete um 09:32 UTC, der
+    # Self-Re-Dispatch griff nicht, und der naechste Schedule waere erst um 12:00
+    # gekommen — zweieinhalb Stunden voellig ohne Ueberwachung, mitten im
+    # Zeitfenster des WhatsApp-Ausfalls, ueber den Andy sich gemeldet hat.
+    # Ein Sicherheitsnetz mit 6 Stunden Maschenweite ist keines.
+    # Die concurrency-group unten macht den engeren Takt gefahrlos: Laeuft schon
+    # ein Job, wartet hoechstens einer, alle weiteren fallen weg. Es gibt also nie
+    # doppelte Pings — aber sobald die Kette reisst, springt sie binnen einer
+    # Stunde von selbst wieder an.
+    - cron: "0 * * * *"
 
 permissions:
   actions: write # für Self-Re-Dispatch via gh
