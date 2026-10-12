@@ -126,11 +126,14 @@ export function kanalWirkungVerdict(kanaele = [], opts = {}) {
  */
 export function kanalQueries({ accountId, platform, seitIso }) {
   const basis = `account_id=eq.${accountId}&created_at=gte.${seitIso}`;
-  const join = `&chats!inner(platform)&chats.platform=eq.${platform}`;
+  // FIX 12.10.2026: Der Join gehoert IN `select=`. Als eigener Parameter liest
+  // PostgREST `chats!inner(platform)` als kaputten Filter und antwortet HTTP 400 —
+  // der Melder stand deshalb seit dem 17.09. dauerhaft auf "ungeprueft".
+  const select = `&select=id,chats!inner(platform)&chats.platform=eq.${platform}`;
   return {
-    eingang: `messages?${basis}&direction=eq.in&source=eq.customer&select=id${join}&limit=1`,
-    kiAntworten: `messages?${basis}&direction=eq.out&source=eq.ai&select=id${join}&limit=1`,
-    manuelleAntworten: `messages?${basis}&direction=eq.out&source=in.(ig_app,dashboard)&select=id${join}&limit=1`,
+    eingang: `messages?${basis}&direction=eq.in&source=eq.customer${select}&limit=1`,
+    kiAntworten: `messages?${basis}&direction=eq.out&source=eq.ai${select}&limit=1`,
+    manuelleAntworten: `messages?${basis}&direction=eq.out&source=in.(ig_app,dashboard)${select}&limit=1`,
     // Chats mit frischem Eingang — Grundgesamtheit fuer den Pausenanteil.
     chats: `chats?account_id=eq.${accountId}&platform=eq.${platform}` +
            `&last_inbound_at=gte.${seitIso}&select=id,ai_paused,ai_enabled`,

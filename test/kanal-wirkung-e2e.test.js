@@ -32,6 +32,18 @@ function baueFetch(datenbank, protokoll = []) {
       return { ok: true, status: 200, json: async () => datenbank.accounts };
     }
 
+    // PostgREST nimmt einen Join nur innerhalb von `select=` an. Steht er als eigener
+    // Parameter in der Abfrage, kommt HTTP 400 zurueck. Der Nachbau war hier frueher
+    // nachsichtiger als das Original — deshalb liefen beide Melder vom 17.09. bis
+    // 12.10.2026 live auf "ungeprueft", waehrend diese Tests gruen waren.
+    const teile = (pfad.split("?")[1] || "").split("&");
+    const select = decodeURIComponent((teile.find((t) => t.startsWith("select=")) || "").slice(7));
+    const ohneWert = teile.some((t) => !t.includes("="));
+    const filtertUeberChat = teile.some((t) => t.startsWith("chats.platform="));
+    if (ohneWert || (filtertUeberChat && !/(^|,)chats!inner\(/.test(select))) {
+      return { ok: false, status: 400, json: async () => ({ code: "PGRST100" }), headers: { get: () => null } };
+    }
+
     const param = (name) => {
       const m = pfad.match(new RegExp(`[?&]${name.replace(".", "\\.")}=([^&]*)`));
       return m ? decodeURIComponent(m[1]) : null;

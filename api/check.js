@@ -240,8 +240,10 @@ export async function checkIngestion(org) {
 
     const kanaele = await Promise.all(paare.map(async ({ a, pl }) => {
       const name = `${a.slug || a.id}/${pl}`;
-      const q = `${base}/rest/v1/messages?select=created_at&direction=eq.in&source=eq.customer` +
-                `&account_id=eq.${a.id}&chats!inner(platform)&chats.platform=eq.${pl}` +
+      // Der Join steht in `select=`, sonst antwortet PostgREST mit HTTP 400 (siehe kanalQueries).
+      const q = `${base}/rest/v1/messages?select=created_at,chats!inner(platform)` +
+                `&direction=eq.in&source=eq.customer` +
+                `&account_id=eq.${a.id}&chats.platform=eq.${pl}` +
                 `&order=created_at.desc&limit=1`;
       const res = await withTimeout((signal) => fetch(q, { signal, headers }), 10000);
       if (!res.ok) return { kanal: name, ungeprueft: true, note: `HTTP ${res.status}` };
