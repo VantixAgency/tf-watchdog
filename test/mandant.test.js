@@ -15,7 +15,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
   checkKanalWirkung, checkIngestion, computeFingerprint,
-  ingestionZeile, kanalZeile, kanalquelleZeilen, ladeKonfiguration,
+  ingestionZeile, kanalZeile, kanalquelleZeilen, kanalquelleLaden, ladeKonfiguration,
 } from "../api/check.js";
 import { pruefeKonfiguration } from "../config/schema.mjs";
 
@@ -297,11 +297,15 @@ test("Vereinigung: IG aktiv, WA inaktiv, aber WA-Verkehr in 7 Tagen -> WA wird w
   });
 });
 
-test("Vereinigung: WA-Verkehr aelter als 7 Tage zaehlt nicht", async () => {
+test("Vereinigung: je Verkehr gehabt -- toter WA-Kanal ohne aktive Zeile, letzter Verkehr vor 30 Tagen, bleibt TOT", async () => {
+  // Mit einem Zeitfenster waere der Kanal nach 7 Tagen aus der Ueberwachung gefallen
+  // und der Alarm haette sich still in eine Entwarnung verwandelt.
   await mitUmgebung(async () => {
-    globalThis.fetch = baueFetch(inkWhatsApp(testInk(tfGesund(leer())), 8 * 24 * 60));
+    globalThis.fetch = baueFetch(inkWhatsApp(testInk(tfGesund(leer())), 30 * 24 * 60));
     const ing = await checkIngestion(ORG_DB);
-    assert.ok(!kanalNamen(ing).includes("test-ink/whatsapp"));
+    assert.ok(ing.tote.some((t) => t.kanal === "test-ink/whatsapp"), JSON.stringify(ing.tote));
+    const fp = computeFingerprint({ ingestion: ing, n8n: { ok: true } }, true);
+    assert.match(fp, /\|ingk:test-ink\/whatsapp:ingestion_tot/, fp);
   });
 });
 
@@ -344,12 +348,40 @@ test("Normalisierung: unbekannter Kanal wird als Problemzeile gemeldet, nicht st
 
 // ---- Flughoehe: nur freigeschaltete Accounts ------------------------------------
 
-test("Flughoehe: Vorfuehr-Studio mit ki_global_on=false und ohne Eingaenge -> kein Befund", async () => {
+test("Flughoehe: Ingestion haengt nicht an der KI -- TF mit ki_global_on=false und totem Eingang bleibt TOT", async () => {
   await mitUmgebung(async () => {
-    const db = testInk(tfGesund(leer()), { eingangVorMin: 40 * 60, kiGlobal: false });
+    const db = tfGesund(leer());
+    db.accounts[0].ki_global_on = false;
+    const lange = vorMin(40 * 60);
+    db.messages.forEach((m) => { m.created_at = lange; });
     globalThis.fetch = baueFetch(db);
     const ing = await checkIngestion(ORG_DB);
+    assert.equal(ing.tote.length, 2, JSON.stringify(ing.tote));
+    assert.match(ingestionZeile(ing.tote[0]), /^INGESTION TOT \(Tattoo Fashion · Tattoo Fashion Muenchen, muenchen\//);
+    const kw = await checkKanalWirkung(ORG_DB);
+    assert.equal(kw.ok, true);
+    assert.equal(kw.note, "kein Account mit ki_global_on=true");
+  });
+});
+
+test("nichtUeberwachen: Vorfuehr-Studio erzeugt in keiner der beiden Pruefungen einen Befund", async () => {
+  const org = { ...ORG_DB, nichtUeberwachen: ["test-ink"] };
+  await mitUmgebung(async () => {
+    globalThis.fetch = baueFetch(testInk(tfGesund(leer()), { eingangVorMin: 40 * 60 }));
+    const ing = await checkIngestion(org);
     assert.equal(ing.tote.length, 0, JSON.stringify(ing.tote));
+    assert.ok(!kanalNamen(ing).some((k) => k.startsWith("test-ink/")));
+    globalThis.fetch = baueFetch(testInk(tfGesund(leer()), { kiAntworten: 0 }));
+    const kw = await checkKanalWirkung(org);
+    assert.equal(kw.befunde.length, 0, JSON.stringify(kw.befunde));
+    assert.ok(!kanalNamen(kw).some((k) => k.startsWith("test-ink/")));
+  });
+});
+
+test("nichtUeberwachen gilt auch ohne Schalter (Default leer = wie heute)", async () => {
+  await mitUmgebung(async () => {
+    globalThis.fetch = baueFetch(testInk(tfGesund(leer()), { eingangVorMin: 40 * 60 }));
+    const ing = await checkIngestion({ ...ORG_ALT, nichtUeberwachen: ["test-ink"] });
     assert.ok(!kanalNamen(ing).some((k) => k.startsWith("test-ink/")));
   });
 });
@@ -413,6 +445,18 @@ test("Marke: mit markePflicht wird der Rueckfall als Problemzeile gemeldet", asy
     globalThis.fetch = baueFetch(db);
     const ing = await checkIngestion({ ...ORG_DB, markePflicht: true });
     assert.deepEqual(kanalquelleZeilen(ing), ["Marke nicht lesbar (HTTP 503)"]);
+  });
+});
+
+test("Geteilt: Accounts und Kanalquelle werden je Durchlauf nur einmal geladen", async () => {
+  await mitUmgebung(async () => {
+    const protokoll = [];
+    globalThis.fetch = baueFetch(testInk(tfGesund(leer())), protokoll);
+    const geteilt = kanalquelleLaden(ORG_DB);
+    const [ing, kw] = await Promise.all([checkIngestion(ORG_DB, geteilt), checkKanalWirkung(ORG_DB, geteilt)]);
+    assert.ok(ing.kanaele.length > 0 && kw.geprueft.length > 0);
+    assert.equal(protokoll.filter((u) => u.includes("/accounts?")).length, 1);
+    assert.equal(protokoll.filter((u) => u.includes("/account_channels?")).length, 1);
   });
 });
 
@@ -480,6 +524,17 @@ test("Konfiguration: kanaeleAusDb muss boolesch sein", () => {
   const r = pruefeKonfiguration(kaputt);
   assert.equal(r.ok, false);
   assert.ok(r.fehler.some((f) => f.includes("kanaeleAusDb")), r.fehler.join("; "));
+});
+
+test("Konfiguration: nichtUeberwachen ist eine Slug-Liste, Default leer", () => {
+  const k = ladeKonfiguration();
+  assert.deepEqual(k.organisationen.find((o) => o.id === "tattoo-fashion").nichtUeberwachen ?? [], []);
+  for (const falsch of ["test-ink", ["Test Ink!"], [1]]) {
+    const kaputt = structuredClone(k);
+    kaputt.organisationen[0].nichtUeberwachen = falsch;
+    const r = pruefeKonfiguration(kaputt);
+    assert.ok(r.fehler.some((f) => f.includes("nichtUeberwachen")), JSON.stringify(falsch));
+  }
 });
 
 test("Konfiguration: markePflicht ist boolesch und bei TF vorerst false (bis 0028 live)", () => {
