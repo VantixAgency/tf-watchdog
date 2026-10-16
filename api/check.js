@@ -215,17 +215,31 @@ export function ingestionVerdict(lastMs, nowMs, opts = {}) {
 
 // ---- Accounts und ihre Kanaele (Task 8, Mandantenfaehigkeit) -------------------
 // Ohne `kanaeleAusDb` gilt fuer jeden Account dieselbe Kanalliste aus der
-// Konfiguration -- exakt wie vor dem Umbau, inklusive derselben Accounts-Abfrage.
-// Mit dem Schalter kommt die Liste je Account aus `account_channels?active=eq.true`:
-// ein reines Instagram-Studio hat dann keinen WhatsApp-Kanal, den der Melder
-// "vermissen" koennte. Marke (aus `mandanten` ueber `accounts.mandant_id`) und
-// Standortname wandern in die Alarmzeilen.
+// Konfiguration -- exakt wie vor dem Umbau, inklusive derselben Accounts-Abfrage
+// (alle Accounts, kein Filter auf ki_global_on).
 //
-// Zwei Rueckfaelle, beide bewusst:
-//  - Embed auf `mandanten` scheitert (Beziehung aus 0028 noch nicht live, PGRST200):
-//    erneut ohne Embed. Sonst waere der Melder bis zur Migration blind.
-//  - Account ohne aktive Kanalzeile: Konfigurationsliste, damit kein Kanal still
-//    aus der Ueberwachung faellt. Der Account steht dann in `kanalQuelleKonfig`.
+// Mit dem Schalter:
+//  - Nur Accounts mit `ki_global_on=true`. Ein Vorfuehr-Studio oder ein Studio vor
+//    der Freischaltung erzeugt keine Befunde (Flughoehe).
+//  - Kanaele je Account = VEREINIGUNG aus aktiven `account_channels`-Zeilen und den
+//    Kanaelen aus `org.kanaele`, auf denen in den letzten 7 Tagen Kundennachrichten
+//    eingingen. So faellt ein Kanal, dessen Zeile fehlt oder inaktiv ist, nicht still
+//    aus der Ueberwachung, solange auf ihm noch Verkehr ist (`kanalAusVerkehr`).
+//  - `platform` wird normalisiert (trim, klein). Ein danach unbekannter Wert wird
+//    NICHT abgefragt (er ginge direkt in eine PostgREST-Abfrage), sondern als
+//    Problemzeile "Kanal unbekannt: <wert>" gemeldet.
+//  - `account_channels` nicht lesbar (jeder Fehlerstatus): Konfigurationsliste fuer
+//    alle Accounts plus Problemzeile "Kanalquelle nicht lesbar (HTTP x)".
+//  - Embed `mandant:mandanten(marke)` scheitert (jeder Fehlerstatus, typisch HTTP 400
+//    solange 0028 nicht live ist): erneut ohne Embed, die Alarme nennen dann nur den
+//    Standort. Eine Problemzeile gibt es nur mit `markePflicht: true` -- der Schalter
+//    wird nach 0028 gesetzt (siehe config/README.md).
+const VERKEHR_TAGE = 7;
+
+function sauber(wert) {
+  return String(wert ?? "").replace(/[^\p{L}\p{N} ._-]/gu, "").trim().slice(0, 40) || "(leer)";
+}
+
 async function ladeAccountsMitKanaelen(org, base, headers) {
   const konfigListe = org?.kanaele?.length ? org.kanaele : ["instagram", "whatsapp"];
   const holen = (pfad) => withTimeout((signal) => fetch(`${base}/rest/v1/${pfad}`, { signal, headers }), 10000);
@@ -237,43 +251,83 @@ async function ladeAccountsMitKanaelen(org, base, headers) {
     return { accounts, paare: (Array.isArray(accounts) ? accounts : []).flatMap((a) => konfigListe.map((pl) => ({ a, pl }))) };
   }
 
-  let accRes = await holen("accounts?select=id,slug,display_name,mandant:mandanten(marke)");
-  let ohneMarke = false;
+  const probleme = [];
+  let accRes = await holen("accounts?select=id,slug,display_name,mandant:mandanten(marke)&ki_global_on=eq.true");
   if (!accRes.ok) {
-    ohneMarke = true;
-    accRes = await holen("accounts?select=id,slug,display_name");
+    if (org?.markePflicht === true) probleme.push(`Marke nicht lesbar (HTTP ${accRes.status})`);
+    accRes = await holen("accounts?select=id,slug,display_name&ki_global_on=eq.true");
   }
   if (!accRes.ok) return { fehlerStatus: accRes.status };
-  const accounts = await accRes.json();
+  const roh = await accRes.json();
+  const accounts = Array.isArray(roh) ? roh : [];
 
-  const kanRes = await holen("account_channels?select=account_id,platform&active=eq.true");
-  if (!kanRes.ok) return { fehlerStatus: kanRes.status, wo: "account_channels" };
-  const zeilen = await kanRes.json();
-  const jeAccount = new Map();
-  // Nur bekannte Kanalnamen: der Wert geht direkt in eine PostgREST-Abfrage.
-  for (const z of Array.isArray(zeilen) ? zeilen : []) {
-    if (!KANAELE.includes(z?.platform)) continue;
-    if (!jeAccount.has(z.account_id)) jeAccount.set(z.account_id, []);
-    const l = jeAccount.get(z.account_id);
-    if (!l.includes(z.platform)) l.push(z.platform);
+  // Kanalzeilen lesen. Scheitert das, gilt die Konfigurationsliste -- laut, nicht still.
+  let zeilen = null;
+  try {
+    const kanRes = await holen("account_channels?select=account_id,platform&active=eq.true");
+    if (kanRes.ok) zeilen = await kanRes.json();
+    else probleme.push(`Kanalquelle nicht lesbar (HTTP ${kanRes.status})`);
+  } catch (e) {
+    probleme.push(`Kanalquelle nicht lesbar (${sauber(e?.name || "Fehler")})`);
   }
+
+  const studioVon = (a) => ({
+    ...(a.mandant?.marke ? { marke: a.mandant.marke } : {}),
+    ...(a.display_name ? { displayName: a.display_name } : {}),
+  });
+
+  if (!Array.isArray(zeilen)) {
+    const paare = accounts.flatMap((a) => konfigListe.map((pl) => ({ a, pl, studio: studioVon(a) })));
+    return { accounts, paare, probleme };
+  }
+
+  const aktivJeAccount = new Map();
+  for (const z of zeilen) {
+    const pl = String(z?.platform ?? "").trim().toLowerCase();
+    if (!KANAELE.includes(pl)) {
+      const a = accounts.find((x) => x.id === z?.account_id);
+      // Zeilen fremder (nicht freigeschalteter) Accounts melden wir nicht -- Flughoehe.
+      if (a) probleme.push(`Kanal unbekannt: ${sauber(pl)} (${a.slug || a.id})`);
+      continue;
+    }
+    if (!aktivJeAccount.has(z.account_id)) aktivJeAccount.set(z.account_id, new Set());
+    aktivJeAccount.get(z.account_id).add(pl);
+  }
+
+  // Verkehr der letzten 7 Tage fuer Konfig-Kanaele ohne aktive Zeile. Ist er nicht
+  // feststellbar, bleibt der Kanal in der Ueberwachung (lieber ein Kanal zu viel).
+  const seitIso = new Date(Date.now() - VERKEHR_TAGE * 864e5).toISOString();
+  const hatVerkehr = async (accountId, pl) => {
+    try {
+      const res = await holen(`messages?select=id,chats!inner(platform)&account_id=eq.${accountId}` +
+        `&chats.platform=eq.${pl}&direction=eq.in&source=eq.customer&created_at=gte.${seitIso}&limit=1`);
+      if (!res.ok) return true;
+      const rows = await res.json();
+      return Array.isArray(rows) ? rows.length > 0 : true;
+    } catch { return true; }
+  };
 
   const paare = [];
-  const kanalQuelleKonfig = [];
-  for (const a of Array.isArray(accounts) ? accounts : []) {
-    const ausDb = jeAccount.get(a.id);
-    const liste = ausDb?.length ? KANAELE.filter((k) => ausDb.includes(k)) : konfigListe;
-    if (!ausDb?.length) kanalQuelleKonfig.push(a.slug || a.id);
-    const studio = {
-      ...(a.mandant?.marke ? { marke: a.mandant.marke } : {}),
-      ...(a.display_name ? { displayName: a.display_name } : {}),
-    };
-    for (const pl of liste) paare.push({ a, pl, studio });
+  const kanalAusVerkehr = [];
+  for (const a of accounts) {
+    const aktiv = aktivJeAccount.get(a.id) || new Set();
+    const zusaetzlich = [];
+    for (const pl of konfigListe) {
+      if (aktiv.has(pl)) continue;
+      if (await hatVerkehr(a.id, pl)) zusaetzlich.push(pl);
+    }
+    const liste = KANAELE.filter((k) => aktiv.has(k) || zusaetzlich.includes(k));
+    for (const pl of zusaetzlich) kanalAusVerkehr.push(`${a.slug || a.id}/${pl}`);
+    for (const pl of liste) paare.push({ a, pl, studio: studioVon(a) });
   }
+  return { accounts, paare, probleme, ...(kanalAusVerkehr.length ? { kanalAusVerkehr: kanalAusVerkehr.sort() } : {}) };
+}
+
+/** Zusatzfelder aus dem Laden der Kanaele -- nur wenn belegt, sonst Paritaet. */
+function kanalquelleFelder(geladen) {
   return {
-    accounts, paare,
-    ...(kanalQuelleKonfig.length ? { kanalQuelleKonfig } : {}),
-    ...(ohneMarke ? { hinweisMarke: "Marke nicht lesbar (Beziehung accounts→mandanten fehlt?), geprueft ohne Marke" } : {}),
+    ...(geladen.probleme?.length ? { kanalquelleProbleme: [...new Set(geladen.probleme)] } : {}),
+    ...(geladen.kanalAusVerkehr ? { kanalAusVerkehr: geladen.kanalAusVerkehr } : {}),
   };
 }
 
@@ -293,8 +347,12 @@ export async function checkIngestion(org) {
     // dass diese Zahl sich bewegt. Genau das ist am 17.09. passiert.
     const geladen = await ladeAccountsMitKanaelen(org, base, headers);
     if (geladen.fehlerStatus)
-      return { skipped: false, ok: true, ungeprueft: true, note: `${geladen.wo === "account_channels" ? "Kanal" : "Accounts"}-Abfrage HTTP ${geladen.fehlerStatus}` };
+      return { skipped: false, ok: true, ungeprueft: true, note: `Accounts-Abfrage HTTP ${geladen.fehlerStatus}` };
     const { accounts, paare } = geladen;
+    // Mit kanaeleAusDb sind nur freigeschaltete Accounts geladen. Keiner davon ist ein
+    // zulaessiger Zustand (alle Studios auf "KI aus"), kein Datenbankfehler.
+    if (org?.kanaeleAusDb === true && accounts.length === 0)
+      return { skipped: false, ok: true, note: "kein Account mit ki_global_on=true", tote: [], kanaele: [], ...kanalquelleFelder(geladen) };
     if (!Array.isArray(accounts) || accounts.length === 0)
       return { skipped: false, ok: false, reason: "keine Accounts in DB", tote: [], kanaele: [] };
 
@@ -338,8 +396,7 @@ export async function checkIngestion(org) {
       staleThresholdH: kanaele.find((k) => k.staleThresholdH)?.staleThresholdH ?? null,
       reason: tote.length ? tote.map((t) => `${t.kanal}: ${t.reason}`).join("; ") : null,
       ...(toteFp ? { toteFp } : {}),
-      ...(geladen.kanalQuelleKonfig ? { kanalQuelleKonfig: geladen.kanalQuelleKonfig } : {}),
-      ...(geladen.hinweisMarke ? { hinweisMarke: geladen.hinweisMarke } : {}),
+      ...kanalquelleFelder(geladen),
     };
   } catch (e) {
     return { skipped: false, ok: true, ungeprueft: true, note: "Ingestion-Check fehlgeschlagen: " + String(e).slice(0, 100) };
@@ -555,8 +612,10 @@ export async function checkKanalWirkung(org) {
   try {
     const geladen = await ladeAccountsMitKanaelen(org, base, headers);
     if (geladen.fehlerStatus)
-      return { skipped: false, ok: true, ungeprueft: true, note: `${geladen.wo === "account_channels" ? "Kanal" : "Accounts"}-Abfrage HTTP ${geladen.fehlerStatus}` };
+      return { skipped: false, ok: true, ungeprueft: true, note: `Accounts-Abfrage HTTP ${geladen.fehlerStatus}` };
     const { accounts, paare } = geladen;
+    if (org?.kanaeleAusDb === true && accounts.length === 0)
+      return { skipped: false, ok: true, note: "kein Account mit ki_global_on=true", befunde: [], geprueft: [], ungeprueft: [], ...kanalquelleFelder(geladen) };
     if (!Array.isArray(accounts) || accounts.length === 0)
       return { skipped: false, ok: false, note: "keine Accounts in der Datenbank gefunden" };
     const studioJeName = new Map(paare.map(({ a, pl, studio }) => [`${a.slug || a.id}/${pl}`, studio || {}]));
@@ -593,8 +652,7 @@ export async function checkKanalWirkung(org) {
     const befunde = verdict.befunde.map((b) => ({ ...b, ...studioJeName.get(b.kanal) }));
     return {
       skipped: false, fensterMin, seit: seitIso, ...verdict, befunde,
-      ...(geladen.kanalQuelleKonfig ? { kanalQuelleKonfig: geladen.kanalQuelleKonfig } : {}),
-      ...(geladen.hinweisMarke ? { hinweisMarke: geladen.hinweisMarke } : {}),
+      ...kanalquelleFelder(geladen),
     };
   } catch (e) {
     // Eine gescheiterte Abfrage darf nicht dauer-alarmieren, aber auch nicht als
@@ -643,6 +701,9 @@ export function computeFingerprint({ ingestion, n8n, execErrors, replyGap, zerni
     // Nur mit kanaeleAusDb gesetzt (siehe checkIngestion); sonst bleibt der Abdruck
     // byte-gleich mit dem Stand vor dem Mandantenumbau.
     ...(ingestion?.toteFp ? [`ingk:${ingestion.toteFp}`] : []),
+    // Ebenso nur mit kanaeleAusDb belegt: Problemzeilen der Kanalquelle.
+    ...(kanalquelleZeilen(ingestion, kanalWirkung).length
+      ? [`kq:${kanalquelleZeilen(ingestion, kanalWirkung).sort().join(",")}`] : []),
   ].join("|");
 }
 
@@ -870,6 +931,11 @@ export function ingestionZeile(t) {
   return `INGESTION TOT (${wer ? wer + ", " : ""}${t.kanal}): seit ${t.ageHours}h keine eingehende Kundennachricht (letzte ${t.lastInbound}) — auf diesem Kanal kommt nichts mehr an.`;
 }
 
+/** Problemzeilen der Kanalquelle (account_channels, Marke), ueber alle Pruefungen ohne Dubletten. */
+export function kanalquelleZeilen(...ergebnisse) {
+  return [...new Set(ergebnisse.flatMap((e) => e?.kanalquelleProbleme || []))];
+}
+
 export function kanalZeile(b) {
   const wer = studioBezeichnung(b);
   return `KANAL STUMM${wer ? ` (${wer})` : ""} — ${b.text}`;
@@ -927,6 +993,8 @@ export default async function handler(req, res) {
   for (const p of zernio.problems || []) problems.push(`ZERNIO: ${p}`);
   // Der wichtigste Melder zuerst nach Zernio: arbeitet der Kanal, oder nimmt er nur an?
   // Das ist die Frage, die am 17.09.2026 niemand gestellt hat.
+  // Kanalquelle (account_channels/Marke): unbekannter Kanal, Quelle nicht lesbar.
+  for (const z of kanalquelleZeilen(ingestion, kanalWirkung)) problems.push(`KANALQUELLE: ${z}`);
   for (const b of kanalWirkung.befunde || []) problems.push(kanalZeile(b));
   // Dann die Stille — der gefährlichste, weil komplett lautlose Ausfall. Je Kanal.
   for (const t of ingestion.tote || []) problems.push(ingestionZeile(t));

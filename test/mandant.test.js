@@ -15,7 +15,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
   checkKanalWirkung, checkIngestion, computeFingerprint,
-  ingestionZeile, kanalZeile, ladeKonfiguration,
+  ingestionZeile, kanalZeile, kanalquelleZeilen, ladeKonfiguration,
 } from "../api/check.js";
 import { pruefeKonfiguration } from "../config/schema.mjs";
 
@@ -30,8 +30,30 @@ const ORG_DB = { ...BASIS, kanaeleAusDb: true };
 const ACC_MUC = "acc-muc";
 const ACC_INK = "acc-ink";
 
-function antwort400() {
-  return { ok: false, status: 400, json: async () => ({ code: "PGRST100" }), headers: { get: () => null } };
+function antwortFehler(status = 400) {
+  return { ok: false, status, json: async () => ({ code: "PGRST100" }), headers: { get: () => null } };
+}
+const antwort400 = () => antwortFehler(400);
+
+// Spalten, die es in der Nachbau-Datenbank gibt. Eine unbekannte Spalte in `select=`
+// oder als Filter beantwortet PostgREST mit HTTP 400 (42703) -- der Nachbau auch.
+const SPALTEN = {
+  accounts: ["id", "slug", "display_name", "ki_global_on", "mandant_id"],
+  account_channels: ["account_id", "platform", "active", "zernio_account_id", "zernio_connect_pending"],
+};
+const STEUERPARAMETER = ["select", "order", "limit", "offset"];
+
+function spaltenPruefen(tabelle, select, teile) {
+  const erlaubt = SPALTEN[tabelle];
+  const embeds = tabelle === "accounts" ? ["mandant:mandanten(marke)"] : [];
+  for (const sp of select.split(",").filter(Boolean)) {
+    if (!erlaubt.includes(sp) && !embeds.includes(sp)) return false;
+  }
+  for (const t of teile) {
+    const name = t.split("=")[0];
+    if (!STEUERPARAMETER.includes(name) && !erlaubt.includes(name)) return false;
+  }
+  return true;
 }
 
 /** PostgREST-Nachbau mit serverseitigen Filtern und strenger Join-Pruefung. */
@@ -50,12 +72,15 @@ function baueFetch(db, protokoll = []) {
     };
 
     if (pfad.startsWith("accounts")) {
+      if (!spaltenPruefen("accounts", select, teile)) return antwort400();
       const willMandant = /mandanten\(/.test(select);
+      if (willMandant && db.embedStatus) return antwortFehler(db.embedStatus);
       if (willMandant && !db.mandantenFk) return antwort400();
-      if (willMandant && !/(^|,)mandant:mandanten\(marke\)/.test(select)) return antwort400();
-      const zeilen = db.accounts.map((a) => {
-        const z = { id: a.id, slug: a.slug };
-        if (/(^|,)display_name(,|$)/.test(select)) z.display_name = a.display_name ?? null;
+      const ki = param("ki_global_on");
+      if (ki !== null && ki !== "eq.true") return antwort400();
+      const zeilen = db.accounts.filter((a) => (ki === "eq.true" ? a.ki_global_on === true : true)).map((a) => {
+        const z = {};
+        for (const sp of select.split(",")) if (SPALTEN.accounts.includes(sp)) z[sp] = a[sp] ?? null;
         if (willMandant) {
           const m = db.mandanten.find((x) => x.id === a.mandant_id);
           z.mandant = m ? { marke: m.marke } : null;
@@ -66,11 +91,13 @@ function baueFetch(db, protokoll = []) {
     }
 
     if (pfad.startsWith("account_channels")) {
+      if (db.channelsStatus) return antwortFehler(db.channelsStatus);
+      if (!spaltenPruefen("account_channels", select, teile)) return antwort400();
       // Ohne den Filter kaemen auch abgeschaltete Kanaele zurueck. Der Nachbau
       // filtert nur, wenn die Abfrage es verlangt -- genau wie PostgREST.
       const aktiv = param("active");
       const rows = db.channels.filter((c) => (aktiv === "eq.true" ? c.active === true : true))
-        .map((c) => ({ account_id: c.account_id, platform: c.platform }));
+        .map((c) => Object.fromEntries(select.split(",").map((sp) => [sp, c[sp] ?? null])));
       return { ok: true, status: 200, json: async () => rows };
     }
 
@@ -111,7 +138,7 @@ const vorMin = (m) => new Date(Date.now() - m * 60000).toISOString();
 
 /** Tattoo Fashion Muenchen, beide Kanaele gesund. */
 function tfGesund(db) {
-  db.accounts.push({ id: ACC_MUC, slug: "muenchen", display_name: "Tattoo Fashion Muenchen", mandant_id: "m-tf" });
+  db.accounts.push({ id: ACC_MUC, slug: "muenchen", display_name: "Tattoo Fashion Muenchen", mandant_id: "m-tf", ki_global_on: true });
   db.mandanten.push({ id: "m-tf", marke: "Tattoo Fashion" });
   db.channels.push({ account_id: ACC_MUC, platform: "instagram", active: true },
                    { account_id: ACC_MUC, platform: "whatsapp", active: true });
@@ -126,11 +153,11 @@ function tfGesund(db) {
 }
 
 /** Reines Instagram-Studio. WhatsApp ist in account_channels nur als INAKTIVE Zeile da. */
-function testInk(db, { eingangVorMin = 20, kiAntworten = 6 } = {}) {
-  db.accounts.push({ id: ACC_INK, slug: "test-ink", display_name: "Test-Ink Berlin", mandant_id: "m-ink" });
+function testInk(db, { eingangVorMin = 20, kiAntworten = 6, kiGlobal = true, kanaele } = {}) {
+  db.accounts.push({ id: ACC_INK, slug: "test-ink", display_name: "Test-Ink Berlin", mandant_id: "m-ink", ki_global_on: kiGlobal });
   db.mandanten.push({ id: "m-ink", marke: "Test-Ink" });
-  db.channels.push({ account_id: ACC_INK, platform: "instagram", active: true },
-                   { account_id: ACC_INK, platform: "whatsapp", active: false });
+  db.channels.push(...(kanaele ?? [{ platform: "instagram", active: true }, { platform: "whatsapp", active: false }])
+    .map((k) => ({ account_id: ACC_INK, ...k })));
   for (let i = 0; i < 4; i++) {
     db.chats.push({ id: `ink${i}`, account_id: ACC_INK, platform: "instagram", ai_paused: false, ai_enabled: true, last_inbound_at: vorMin(eingangVorMin) });
   }
@@ -236,16 +263,156 @@ test("Mandant: fehlt die Beziehung zu mandanten (0028 noch nicht live), prueft d
   });
 });
 
-test("Mandant: Account ohne aktive Kanalzeile faellt auf die Konfigurationsliste zurueck", async () => {
-  // Fehlen TF-Zeilen in account_channels, darf WhatsApp nicht still aus der
-  // Ueberwachung fallen.
+/** WhatsApp-Verkehr fuer Test-Ink: 6 Kundennachrichten vor `vorMinute`, KI antwortet. */
+function inkWhatsApp(db, vorMinute = 30) {
+  for (let i = 0; i < 4; i++) db.chats.push({ id: `inkwa${i}`, account_id: ACC_INK, platform: "whatsapp", ai_paused: false, ai_enabled: true, last_inbound_at: vorMin(vorMinute) });
+  for (let i = 0; i < 6; i++) db.messages.push({ account_id: ACC_INK, chat_id: `inkwa${i % 4}`, direction: "in", source: "customer", created_at: vorMin(vorMinute + i) });
+  for (let i = 0; i < 6; i++) db.messages.push({ account_id: ACC_INK, chat_id: `inkwa${i % 4}`, direction: "out", source: "ai", created_at: vorMin(vorMinute - 5) });
+  return db;
+}
+
+const kanalNamen = (r) => [...(r.geprueft || []), ...(r.ungeprueft || []), ...(r.kanaele || [])].map((k) => k.kanal);
+
+test("Vereinigung: TF ohne Kanalzeilen behaelt beide Kanaele ueber den Verkehr", async () => {
+  // Fehlen TF-Zeilen in account_channels, darf kein Kanal still aus der Ueberwachung fallen.
   await mitUmgebung(async () => {
     const db = tfGesund(leer());
     db.channels = [];
     globalThis.fetch = baueFetch(db);
     const ing = await checkIngestion(ORG_DB);
     assert.deepEqual(ing.kanaele.map((k) => k.kanal).sort(), ["muenchen/instagram", "muenchen/whatsapp"]);
-    assert.deepEqual(ing.kanalQuelleKonfig, ["muenchen"]);
+    assert.deepEqual(ing.kanalAusVerkehr, ["muenchen/instagram", "muenchen/whatsapp"]);
+  });
+});
+
+test("Vereinigung: IG aktiv, WA inaktiv, aber WA-Verkehr in 7 Tagen -> WA wird weiter geprueft", async () => {
+  await mitUmgebung(async () => {
+    const db = inkWhatsApp(testInk(tfGesund(leer())), 3 * 24 * 60);
+    globalThis.fetch = baueFetch(db);
+    const ing = await checkIngestion(ORG_DB);
+    const kw = await checkKanalWirkung(ORG_DB);
+    assert.ok(kanalNamen(ing).includes("test-ink/whatsapp"), kanalNamen(ing).join(","));
+    assert.ok(kanalNamen(kw).includes("test-ink/whatsapp"), kanalNamen(kw).join(","));
+    assert.ok(ing.kanalAusVerkehr.includes("test-ink/whatsapp"));
+  });
+});
+
+test("Vereinigung: WA-Verkehr aelter als 7 Tage zaehlt nicht", async () => {
+  await mitUmgebung(async () => {
+    globalThis.fetch = baueFetch(inkWhatsApp(testInk(tfGesund(leer())), 8 * 24 * 60));
+    const ing = await checkIngestion(ORG_DB);
+    assert.ok(!kanalNamen(ing).includes("test-ink/whatsapp"));
+  });
+});
+
+test("Vereinigung: nur inaktive Zeilen -> geprueft wird, was Verkehr hat", async () => {
+  await mitUmgebung(async () => {
+    const db = testInk(tfGesund(leer()), { kanaele: [{ platform: "instagram", active: false }, { platform: "whatsapp", active: false }] });
+    globalThis.fetch = baueFetch(db);
+    const ing = await checkIngestion(ORG_DB);
+    const ink = kanalNamen(ing).filter((k) => k.startsWith("test-ink/"));
+    assert.deepEqual(ink, ["test-ink/instagram"], "IG hat Verkehr, WA nicht");
+    assert.equal(ing.kanalquelleProbleme, undefined);
+  });
+});
+
+test("Normalisierung: 'Instagram ' aus der DB wird als instagram ueberwacht, ohne Problemzeile", async () => {
+  await mitUmgebung(async () => {
+    const db = testInk(tfGesund(leer()), { kanaele: [{ platform: " Instagram ", active: true }] });
+    db.messages = db.messages.filter((m) => m.account_id !== ACC_INK); // kein Verkehr: nur die Zeile zaehlt
+    globalThis.fetch = baueFetch(db);
+    const ing = await checkIngestion(ORG_DB);
+    assert.ok(kanalNamen(ing).includes("test-ink/instagram"), kanalNamen(ing).join(","));
+    assert.deepEqual(kanalquelleZeilen(ing), []);
+  });
+});
+
+test("Normalisierung: unbekannter Kanal wird als Problemzeile gemeldet, nicht still verworfen", async () => {
+  await mitUmgebung(async () => {
+    const protokoll = [];
+    const db = testInk(tfGesund(leer()), { kanaele: [{ platform: "instagram", active: true }, { platform: "TikTok", active: true }] });
+    globalThis.fetch = baueFetch(db, protokoll);
+    const ing = await checkIngestion(ORG_DB);
+    const kw = await checkKanalWirkung(ORG_DB);
+    assert.deepEqual(kanalquelleZeilen(ing, kw), ["Kanal unbekannt: tiktok (test-ink)"]);
+    assert.ok(!protokoll.filter((u) => !u.includes("/account_channels?")).some((u) => /tiktok/i.test(u)),
+      "unbekannter Wert geht in keine Abfrage");
+    const fp = computeFingerprint({ ingestion: ing, n8n: { ok: true }, kanalWirkung: kw }, true);
+    assert.match(fp, /\|kq:Kanal unbekannt: tiktok \(test-ink\)/, fp);
+  });
+});
+
+// ---- Flughoehe: nur freigeschaltete Accounts ------------------------------------
+
+test("Flughoehe: Vorfuehr-Studio mit ki_global_on=false und ohne Eingaenge -> kein Befund", async () => {
+  await mitUmgebung(async () => {
+    const db = testInk(tfGesund(leer()), { eingangVorMin: 40 * 60, kiGlobal: false });
+    globalThis.fetch = baueFetch(db);
+    const ing = await checkIngestion(ORG_DB);
+    assert.equal(ing.tote.length, 0, JSON.stringify(ing.tote));
+    assert.ok(!kanalNamen(ing).some((k) => k.startsWith("test-ink/")));
+  });
+});
+
+test("Flughoehe: Studio vor Freischaltung mit Eingaengen und ohne KI -> kein KANAL STUMM", async () => {
+  await mitUmgebung(async () => {
+    const db = testInk(tfGesund(leer()), { kiAntworten: 0, kiGlobal: false });
+    globalThis.fetch = baueFetch(db);
+    const kw = await checkKanalWirkung(ORG_DB);
+    assert.equal(kw.befunde.length, 0, JSON.stringify(kw.befunde));
+  });
+});
+
+test("Flughoehe: ohne Schalter wird wie heute nicht nach ki_global_on gefiltert", async () => {
+  await mitUmgebung(async () => {
+    const protokoll = [];
+    globalThis.fetch = baueFetch(testInk(tfGesund(leer()), { kiAntworten: 0, kiGlobal: false }), protokoll);
+    const kw = await checkKanalWirkung(ORG_ALT);
+    assert.equal(kw.befunde.length, 1);
+    assert.ok(!protokoll.some((u) => u.includes("ki_global_on")));
+  });
+});
+
+// ---- Kanalquelle nicht lesbar -----------------------------------------------------
+
+for (const status of [400, 500]) {
+  test(`Kanalquelle HTTP ${status}: Rueckfall auf die Konfigurationsliste plus Problemzeile`, async () => {
+    await mitUmgebung(async () => {
+      const db = testInk(tfGesund(leer()));
+      db.channelsStatus = status;
+      globalThis.fetch = baueFetch(db);
+      const ing = await checkIngestion(ORG_DB);
+      const kw = await checkKanalWirkung(ORG_DB);
+      assert.notEqual(ing.ungeprueft, true, ing.note);
+      assert.notEqual(kw.ungeprueft, true, kw.note);
+      assert.deepEqual(kanalNamen(ing).sort(),
+        ["muenchen/instagram", "muenchen/whatsapp", "test-ink/instagram", "test-ink/whatsapp"]);
+      assert.deepEqual(kanalquelleZeilen(ing, kw), [`Kanalquelle nicht lesbar (HTTP ${status})`]);
+    });
+  });
+}
+
+// ---- Marke nicht lesbar -----------------------------------------------------------
+
+test("Marke: Embed mit HTTP 503 -> Rueckfall ohne Marke, ohne markePflicht keine Problemzeile", async () => {
+  await mitUmgebung(async () => {
+    const db = testInk(tfGesund(leer()), { eingangVorMin: 40 * 60 });
+    db.embedStatus = 503;
+    globalThis.fetch = baueFetch(db);
+    const ing = await checkIngestion(ORG_DB);
+    assert.equal(ing.tote.length, 1);
+    assert.match(ingestionZeile(ing.tote[0]), /\(Test-Ink Berlin, test-ink\/instagram\)/);
+    assert.deepEqual(kanalquelleZeilen(ing), []);
+  });
+});
+
+test("Marke: mit markePflicht wird der Rueckfall als Problemzeile gemeldet", async () => {
+  await mitUmgebung(async () => {
+    const db = testInk(tfGesund(leer()));
+    db.embedStatus = 503;
+    globalThis.fetch = baueFetch(db);
+    const ing = await checkIngestion({ ...ORG_DB, markePflicht: true });
+    assert.deepEqual(kanalquelleZeilen(ing), ["Marke nicht lesbar (HTTP 503)"]);
   });
 });
 
@@ -263,7 +430,7 @@ function datenbankVorfall() {
   for (let i = 0; i < 6; i++) messages.push({ account_id: ACC_MUC, chat_id: `ig${i % 4}`, direction: "out", source: "ai", created_at: vorMin(10 + i) });
   // Wie im Bestands-Fixture: kein display_name, kein Mandant.
   return {
-    accounts: [{ id: ACC_MUC, slug: "muenchen" }], mandanten: [], mandantenFk: true,
+    accounts: [{ id: ACC_MUC, slug: "muenchen", ki_global_on: true }], mandanten: [], mandantenFk: true,
     channels: [{ account_id: ACC_MUC, platform: "instagram", active: true }, { account_id: ACC_MUC, platform: "whatsapp", active: true }],
     chats, messages,
   };
@@ -313,4 +480,13 @@ test("Konfiguration: kanaeleAusDb muss boolesch sein", () => {
   const r = pruefeKonfiguration(kaputt);
   assert.equal(r.ok, false);
   assert.ok(r.fehler.some((f) => f.includes("kanaeleAusDb")), r.fehler.join("; "));
+});
+
+test("Konfiguration: markePflicht ist boolesch und bei TF vorerst false (bis 0028 live)", () => {
+  const k = ladeKonfiguration();
+  assert.equal(k.organisationen.find((o) => o.id === "tattoo-fashion").markePflicht, false);
+  const kaputt = structuredClone(k);
+  kaputt.organisationen[0].markePflicht = 1;
+  const r = pruefeKonfiguration(kaputt);
+  assert.ok(r.fehler.some((f) => f.includes("markePflicht")), r.fehler.join("; "));
 });
