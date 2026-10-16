@@ -17,8 +17,9 @@ import {
   checkKanalWirkung, checkIngestion, computeFingerprint,
   ingestionZeile, kanalZeile, kanalquelleZeilen, kanalquelleLaden, ladeKonfiguration,
   ausgenommenListe, ausgenommenFeld, problemMailText, entwarnungMailText,
+  erstelleHandler,
 } from "../api/check.js";
-import { pruefeKonfiguration } from "../config/schema.mjs";
+import { pruefeKonfiguration, mitVorgaben } from "../config/schema.mjs";
 
 const BASIS = {
   kanaele: ["instagram", "whatsapp"],
@@ -521,6 +522,74 @@ test("Paritaet: ohne Ausnahmen sind Alarm- und Entwarnungsmail byte-gleich wie v
       "",
       `Zeit: ${JETZT}`,
     ].join("\n"));
+  }
+});
+
+test("nichtUeberwachenKanal: keine Verkehrsabfrage und kein kanalAusVerkehr fuer stillgelegte Kanaele", async () => {
+  await mitUmgebung(async () => {
+    const db = tfGesund(leer());
+    db.channels = []; // beide Kanaele nur ueber Verkehr erreichbar
+    const protokoll = [];
+    globalThis.fetch = baueFetch(db, protokoll);
+    const ing = await checkIngestion({ ...ORG_DB, nichtUeberwachenKanal: ["muenchen/whatsapp"] });
+    assert.deepEqual(ing.kanalAusVerkehr, ["muenchen/instagram"]);
+    const waAbfragen = protokoll.filter((u) => u.includes("/messages?") && u.includes("chats.platform=eq.whatsapp"));
+    assert.equal(waAbfragen.length, 0, waAbfragen.join("\n"));
+  });
+});
+
+test("Handler: voller Durchlauf mit injizierter Konfig -- Ausnahmen in Antwort und Mail, stillgelegter Kanal ungeprueft", async () => {
+  const org = mitVorgaben({
+    id: "test-org", anzeigename: "Test", kritischeWorkflows: [{ id: "wf-test", bezeichnung: "Test" }],
+    pruefungen: ["ingestion", "kanal_wirkung"], kanaele: ["instagram", "whatsapp"], kanaeleAusDb: true,
+    nichtUeberwachen: ["test-ink"], nichtUeberwachenKanal: ["muenchen/whatsapp"],
+    alarm: { email: ["alarm@example.test"], telegramChatIds: [] },
+    secretRefs: { datenbankUrl: "SUPABASE_URL" },
+  });
+  assert.equal(pruefeKonfiguration({ organisationen: [org] }).ok, true);
+  const handler = erstelleHandler({ konfigLaden: () => ({ organisationen: [org] }) });
+
+  const alt = { cron: process.env.CRON_SECRET, resend: process.env.RESEND_API_KEY };
+  delete process.env.CRON_SECRET;
+  process.env.RESEND_API_KEY = "test-resend";
+  try {
+    await mitUmgebung(async () => {
+      const db = testInk(tfGesund(leer()), { eingangVorMin: 40 * 60 });
+      db.messages.filter((m) => m.account_id === ACC_MUC).forEach((m) => { m.created_at = vorMin(40 * 60); });
+      const mails = [];
+      const protokoll = [];
+      const db_fetch = baueFetch(db, protokoll);
+      globalThis.fetch = async (u, init) => {
+        if (String(u).startsWith("https://api.resend.com/")) {
+          mails.push(JSON.parse(init.body));
+          return { ok: true, status: 200, json: async () => ({}) };
+        }
+        return db_fetch(u, init);
+      };
+      const lauf = async (query) => {
+        let status = null; let body = null;
+        const res = { status(c) { status = c; return this; }, json(b) { body = b; return this; } };
+        await handler({ headers: {}, query }, res);
+        return { status, body };
+      };
+      const erst = await lauf({});
+      assert.equal(erst.status, 200);
+      assert.deepEqual(erst.body.ausgenommen, ["test-ink", "muenchen/whatsapp"]);
+      const geprueft = erst.body.ingestion.kanaele.map((k) => k.kanal);
+      assert.deepEqual(geprueft, ["muenchen/instagram"], "stillgelegter Kanal und ausgenommenes Studio fehlen");
+      assert.ok(!protokoll.some((u) => u.includes("chats.platform=eq.whatsapp")), "keine Abfrage fuer muenchen/whatsapp");
+      assert.equal(mails.length, 0, "erst beim zweiten Sehen wird gemailt");
+
+      const zweit = await lauf({ prev: erst.body.fp, sinceAlert: "999999" });
+      assert.equal(zweit.body.alerted?.problem, true, JSON.stringify(zweit.body.alerted));
+      assert.equal(mails.length, 1);
+      assert.match(mails[0].text, /\nNicht überwacht: test-ink, muenchen\/whatsapp\n/);
+      assert.match(mails[0].text, /INGESTION TOT \(Tattoo Fashion · Tattoo Fashion Muenchen, muenchen\/instagram\)/);
+      assert.doesNotMatch(mails[0].text, /test-ink\/instagram|muenchen\/whatsapp\)/);
+    });
+  } finally {
+    if (alt.cron === undefined) delete process.env.CRON_SECRET; else process.env.CRON_SECRET = alt.cron;
+    if (alt.resend === undefined) delete process.env.RESEND_API_KEY; else process.env.RESEND_API_KEY = alt.resend;
   }
 });
 

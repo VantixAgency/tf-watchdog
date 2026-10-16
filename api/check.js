@@ -319,7 +319,8 @@ async function ladeAccountsMitKanaelen(org, base, headers) {
   // Alle Verkehrsabfragen parallel, nicht Account fuer Account.
   const jeAccount = await Promise.all(accounts.map(async (a) => {
     const aktiv = aktivJeAccount.get(a.id) || new Set();
-    const offen = konfigListe.filter((pl) => !aktiv.has(pl));
+    // Stillgelegte Kanaele brauchen keine Verkehrsabfrage und tauchen nicht in kanalAusVerkehr auf.
+    const offen = konfigListe.filter((pl) => !aktiv.has(pl) && kanalAn(a, pl));
     const verkehr = await Promise.all(offen.map((pl) => hatVerkehr(a.id, pl)));
     return { a, aktiv, zusaetzlich: offen.filter((_, i) => verkehr[i]) };
   }));
@@ -1022,7 +1023,7 @@ export function entwarnungMailText({ ingestion, replyGap, jetztIso, org }) {
   ].join("\n");
 }
 
-export default async function handler(req, res) {
+async function pruefDurchlauf(konfigLaden, req, res) {
   // Auth: Vercel-Cron sendet "Authorization: Bearer <CRON_SECRET>". Manuell: ?key=<CRON_SECRET>.
   const secret = process.env.CRON_SECRET;
   const auth = req.headers.authorization || "";
@@ -1035,7 +1036,7 @@ export default async function handler(req, res) {
   // zu stillem Betrieb fuehren -- ein Melder, der nichts prueft, ist schlimmer als keiner.
   let konfiguration;
   try {
-    konfiguration = ladeKonfiguration();
+    konfiguration = konfigLaden();
   } catch (e) {
     return res.status(500).json({ error: "config-invalid", detail: String(e.message).slice(0, 800) });
   }
@@ -1160,3 +1161,15 @@ export default async function handler(req, res) {
     ...ausgenommenFeld(org),
   });
 }
+
+/**
+ * Baut den Handler. Produktion nutzt die Vorgabe (Konfig aus config/installationen.json,
+ * validiert). Tests koennen eine Konfig injizieren, ohne Dateien oder Umgebung zu aendern.
+ */
+export function erstelleHandler({ konfigLaden = ladeKonfiguration } = {}) {
+  return async function handler(req, res) {
+    return pruefDurchlauf(konfigLaden, req, res);
+  };
+}
+
+export default erstelleHandler();
