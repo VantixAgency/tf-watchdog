@@ -29,11 +29,29 @@ Jetzt kommt alles aus `installationen.json`, validiert gegen `schema.mjs`.
 | `pruefungen` | ja | Auswahl aus `PRUEFUNGEN` |
 | `provider.webhookMatch` | fuer `provider_webhook` | organisationseigener Match |
 | `kanaele` | fuer `kanal_wirkung` | Liste aus `instagram`/`whatsapp`; wird NICHT geraten |
-| `kanaeleAusDb` | nein | `true`: Kanaele je Account aus `account_channels?active=eq.true`, Marke/Standort im Alarmtext. Account ohne aktive Zeile faellt auf `kanaele` zurueck. Ohne Schalter Verhalten wie vorher |
+| `kanaeleAusDb` | nein | `true`: nur Accounts mit `ki_global_on=true`; Kanaele je Account = aktive `account_channels`-Zeilen ∪ Kanaele aus `kanaele` mit Kundennachrichten in 7 Tagen; Marke/Standort im Alarmtext. Unbekannter Kanalwert und nicht lesbare Kanalquelle werden als `KANALQUELLE:`-Problem gemeldet. Ohne Schalter Verhalten wie vorher |
+| `markePflicht` | nein | `true`: scheitert der Embed `mandant:mandanten(marke)`, ist das ein Problem (`Marke nicht lesbar (HTTP x)`). Default und TF vorerst `false` |
 | `alarm.email` / `alarm.telegramChatIds` | mindestens eines | Empfaenger |
 | `alarm.betreffProblem` / `betreffOk` / `absender` | nein | sonst neutrale Vorgabe |
 | `schwellen.*` | nein | innerhalb `GRENZEN`, sonst abgelehnt |
 | `secretRefs.*` | nein | Variablennamen, nie Werte |
+
+## Runbook: Mandantenumbau (Plan 2026-10-16, Task 8)
+
+- **Fingerprint wechselt beim Deploy.** Mit `kanaeleAusDb` kommen die Bausteine
+  `ingk:<slug>/<kanal>:ingestion_tot` und `kq:<problemzeilen>` dazu. Steht beim Deploy
+  ein Ingestion-Alarm oder ein Kanalquellen-Problem an, gilt das als neuer Zustand:
+  nach der Zweifach-Bestaetigung kommt **eine** erneute Alarm-Mail. Ohne anstehendes
+  Problem aendert sich nichts (`OK` bleibt `OK`).
+- **`markePflicht` erst nach 0028.** Bis Migration 0028 live ist, scheitert der Embed
+  auf `mandanten` (HTTP 400) und der Melder prueft ohne Marke weiter. Nach 0028 und dem
+  Probe-GET des Embeds `markePflicht: true` setzen, dann ist eine fehlende Marke laut.
+- **Vor dem Schalter live:** pruefen, dass TF je Account aktive `account_channels`-Zeilen
+  fuer Instagram und WhatsApp hat. Fehlen sie, haelt nur der 7-Tage-Verkehr den Kanal in
+  der Ueberwachung (`kanalAusVerkehr` in der Antwort zeigt das an).
+- **ki_global_on:** Mit dem Schalter werden Accounts mit `ki_global_on=false` nicht
+  ueberwacht, auch ihre Ingestion nicht. Stellt ein Studio die KI global aus, sieht der
+  Watchdog es bis zum Wiedereinschalten nicht.
 
 ## Warum `kanal_wirkung` seit dem 17.09.2026 dabei ist
 

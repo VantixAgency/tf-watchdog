@@ -39,6 +39,7 @@
         "whatsapp"
       ],
       "kanaeleAusDb": true,
+      "markePflicht": false,
       "provider": {
         "art": "zernio",
         "webhookMatch": "tattoo-fashion-zernio-ingest"

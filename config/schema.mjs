@@ -87,6 +87,9 @@ export function pruefeOrganisation(org, index = 0) {
   // true/false: ein "ja" waere stillschweigend falsy und der Schalter wirkungslos.
   if (org?.kanaeleAusDb !== undefined && typeof org.kanaeleAusDb !== 'boolean')
     f.push(`${wo('kanaeleAusDb')} muss true oder false sein`);
+  // Nach Migration 0028 auf true: dann ist eine nicht lesbare Marke ein Problem.
+  if (org?.markePflicht !== undefined && typeof org.markePflicht !== 'boolean')
+    f.push(`${wo('markePflicht')} muss true oder false sein`);
   if ((org?.pruefungen ?? []).includes('kanal_wirkung') && org?.kanaele === undefined)
     f.push(`${wo('kanaele')} fehlt, obwohl kanal_wirkung geprueft werden soll — sonst raet der Melder, welche Kanaele es gibt`);
 
