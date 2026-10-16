@@ -16,6 +16,7 @@ import assert from "node:assert/strict";
 import {
   checkKanalWirkung, checkIngestion, computeFingerprint,
   ingestionZeile, kanalZeile, kanalquelleZeilen, kanalquelleLaden, ladeKonfiguration,
+  ausgenommenListe, ausgenommenFeld, problemMailText, entwarnungMailText,
 } from "../api/check.js";
 import { pruefeKonfiguration } from "../config/schema.mjs";
 
@@ -460,6 +461,69 @@ test("Geteilt: Accounts und Kanalquelle werden je Durchlauf nur einmal geladen",
   });
 });
 
+// ---- Ausnahmen sichtbar machen ---------------------------------------------------
+
+test("nichtUeberwachenKanal: einzelner Kanal faellt aus beiden Pruefungen, mit und ohne Schalter", async () => {
+  for (const basis of [ORG_DB, ORG_ALT]) {
+    const org = { ...basis, nichtUeberwachenKanal: ["muenchen/whatsapp"] };
+    await mitUmgebung(async () => {
+      const db = tfGesund(leer());
+      const lange = vorMin(40 * 60);
+      db.messages.forEach((m) => { m.created_at = lange; });
+      globalThis.fetch = baueFetch(db);
+      const ing = await checkIngestion(org);
+      const kw = await checkKanalWirkung(org);
+      assert.deepEqual(ing.kanaele.map((k) => k.kanal), ["muenchen/instagram"], JSON.stringify(basis));
+      assert.deepEqual(ing.tote.map((t) => t.kanal), ["muenchen/instagram"]);
+      assert.ok(!kanalNamen(kw).includes("muenchen/whatsapp"));
+    });
+  }
+});
+
+test("Ausnahmen: Liste fuer Antwort und Mail aus Studios und Kanaelen", () => {
+  const org = { nichtUeberwachen: ["test-ink"], nichtUeberwachenKanal: ["muenchen/whatsapp"] };
+  assert.deepEqual(ausgenommenListe(org), ["test-ink", "muenchen/whatsapp"]);
+  assert.deepEqual(ausgenommenFeld(org), { ausgenommen: ["test-ink", "muenchen/whatsapp"] });
+  assert.deepEqual(ausgenommenFeld({ nichtUeberwachen: [], nichtUeberwachenKanal: [] }), {});
+  assert.deepEqual(ausgenommenFeld({}), {});
+});
+
+const JETZT = "2026-10-16T12:00:00.000Z";
+const PROBLEME = ["INGESTION TOT (muenchen/whatsapp): seit 40h …"];
+const SCHRITTE = ["→ Schritt eins"];
+
+test("Mail: Alarm und Entwarnung nennen 'Nicht überwacht: …', wenn Ausnahmen bestehen", () => {
+  const org = { nichtUeberwachen: ["test-ink"], nichtUeberwachenKanal: ["muenchen/whatsapp"] };
+  const alarm = problemMailText({ problems: PROBLEME, schritte: SCHRITTE, jetztIso: JETZT, org });
+  const ok = entwarnungMailText({ ingestion: { lastInbound: JETZT }, replyGap: { stuckCount: 0 }, jetztIso: JETZT, org });
+  for (const t of [alarm, ok]) assert.match(t, /\nNicht überwacht: test-ink, muenchen\/whatsapp\n/);
+});
+
+test("Paritaet: ohne Ausnahmen sind Alarm- und Entwarnungsmail byte-gleich wie vorher", () => {
+  for (const org of [{}, { nichtUeberwachen: [], nichtUeberwachenKanal: [] }]) {
+    assert.equal(problemMailText({ problems: PROBLEME, schritte: SCHRITTE, jetztIso: JETZT, org }), [
+      "Der Watchdog hat ein Problem erkannt:",
+      "",
+      ...PROBLEME.map((p) => "• " + p),
+      "",
+      "Was zu tun ist:",
+      ...SCHRITTE,
+      "",
+      `Zeit: ${JETZT}`,
+      "(Gemeldet wird erst, wenn ein Problem zweimal hintereinander auftaucht — diese",
+      "Meldung stand also mindestens 5 Minuten an. Wiederholung frühestens in 2h.)",
+    ].join("\n"));
+    assert.equal(entwarnungMailText({ ingestion: {}, replyGap: {}, jetztIso: JETZT, org }), [
+      "Entwarnung — die Automation läuft wieder normal.",
+      "",
+      "Letzter Eingang: ?",
+      "Offene KI-Chats: 0",
+      "",
+      `Zeit: ${JETZT}`,
+    ].join("\n"));
+  }
+});
+
 // ---- Paritaet: nur TF -> wie heute ------------------------------------------
 
 /** Dieselbe Lage wie datenbankVorfall() in test/kanal-wirkung-e2e.test.js (17.09.2026). */
@@ -535,6 +599,20 @@ test("Konfiguration: nichtUeberwachen ist eine Slug-Liste, Default leer", () => 
     const r = pruefeKonfiguration(kaputt);
     assert.ok(r.fehler.some((f) => f.includes("nichtUeberwachen")), JSON.stringify(falsch));
   }
+});
+
+test("Konfiguration: nichtUeberwachenKanal ist eine Liste aus slug/kanal, Default leer", () => {
+  const k = ladeKonfiguration();
+  assert.deepEqual(k.organisationen.find((o) => o.id === "tattoo-fashion").nichtUeberwachenKanal, []);
+  for (const falsch of ["muenchen/whatsapp", ["muenchen"], ["muenchen/tiktok"], ["Muenchen/whatsapp"]]) {
+    const kaputt = structuredClone(k);
+    kaputt.organisationen[0].nichtUeberwachenKanal = falsch;
+    const r = pruefeKonfiguration(kaputt);
+    assert.ok(r.fehler.some((f) => f.includes("nichtUeberwachenKanal")), JSON.stringify(falsch));
+  }
+  const gut = structuredClone(k);
+  gut.organisationen[0].nichtUeberwachenKanal = ["muenchen/whatsapp"];
+  assert.equal(pruefeKonfiguration(gut).ok, true, pruefeKonfiguration(gut).fehler.join("; "));
 });
 
 test("Konfiguration: markePflicht ist boolesch und bei TF vorerst false (bis 0028 live)", () => {

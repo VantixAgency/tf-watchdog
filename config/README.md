@@ -31,6 +31,7 @@ Jetzt kommt alles aus `installationen.json`, validiert gegen `schema.mjs`.
 | `kanaele` | fuer `kanal_wirkung` | Liste aus `instagram`/`whatsapp`; wird NICHT geraten |
 | `kanaeleAusDb` | nein | `true`: Kanaele je Account = aktive `account_channels`-Zeilen ∪ Kanaele aus `kanaele`, auf denen je eine Kundennachricht einging (ohne Zeitgrenze); Ingestion prueft alle Accounts, Kanal-Wirkung nur `ki_global_on=true`; Marke/Standort im Alarmtext. Unbekannter Kanalwert und nicht lesbare Kanalquelle werden als `KANALQUELLE:`-Problem gemeldet. Ohne Schalter Verhalten wie vorher |
 | `nichtUeberwachen` | nein | Slug-Liste (Vorfuehr-/Probe-Studios), von Ingestion und Kanal-Wirkung ausgenommen. Default leer |
+| `nichtUeberwachenKanal` | nein | Liste `"slug/kanal"`: einzelner Kanal von beiden Pruefungen ausgenommen. Beide Ausnahmelisten stehen als `ausgenommen` in der API-Antwort und als Zeile „Nicht überwacht: …“ in jeder Alarm- und Entwarnungsmail. Default leer |
 | `markePflicht` | nein | `true`: scheitert der Embed `mandant:mandanten(marke)`, ist das ein Problem (`Marke nicht lesbar (HTTP x)`). Default und TF vorerst `false` |
 | `alarm.email` / `alarm.telegramChatIds` | mindestens eines | Empfaenger |
 | `alarm.betreffProblem` / `betreffOk` / `absender` | nein | sonst neutrale Vorgabe |

@@ -247,6 +247,9 @@ async function ladeAccountsMitKanaelen(org, base, headers) {
 
   const ausgenommen = new Set(Array.isArray(org?.nichtUeberwachen) ? org.nichtUeberwachen : []);
   const ueberwacht = (liste) => liste.filter((a) => !ausgenommen.has(a?.slug));
+  // Einzelne Kanaele stilllegen ("slug/kanal"), z. B. ein Kanal, der bewusst ruht.
+  const kanalAus = new Set(Array.isArray(org?.nichtUeberwachenKanal) ? org.nichtUeberwachenKanal : []);
+  const kanalAn = (a, pl) => !kanalAus.has(`${a?.slug}/${pl}`);
 
   if (org?.kanaeleAusDb !== true) {
     const accRes = await holen("accounts?select=id,slug");
@@ -254,7 +257,7 @@ async function ladeAccountsMitKanaelen(org, base, headers) {
     const roh = await accRes.json();
     const accounts = Array.isArray(roh) ? ueberwacht(roh) : roh;
     return { accounts, rohAnzahl: Array.isArray(roh) ? roh.length : 0,
-             paare: (Array.isArray(accounts) ? accounts : []).flatMap((a) => konfigListe.map((pl) => ({ a, pl }))) };
+             paare: (Array.isArray(accounts) ? accounts : []).flatMap((a) => konfigListe.filter((pl) => kanalAn(a, pl)).map((pl) => ({ a, pl }))) };
   }
 
   const probleme = [];
@@ -284,7 +287,7 @@ async function ladeAccountsMitKanaelen(org, base, headers) {
   });
 
   if (!Array.isArray(zeilen)) {
-    const paare = accounts.flatMap((a) => konfigListe.map((pl) => ({ a, pl, studio: studioVon(a) })));
+    const paare = accounts.flatMap((a) => konfigListe.filter((pl) => kanalAn(a, pl)).map((pl) => ({ a, pl, studio: studioVon(a) })));
     return { accounts, rohAnzahl, paare, probleme };
   }
 
@@ -323,7 +326,7 @@ async function ladeAccountsMitKanaelen(org, base, headers) {
   const paare = [];
   const kanalAusVerkehr = [];
   for (const { a, aktiv, zusaetzlich } of jeAccount) {
-    const liste = KANAELE.filter((k) => aktiv.has(k) || zusaetzlich.includes(k));
+    const liste = KANAELE.filter((k) => (aktiv.has(k) || zusaetzlich.includes(k)) && kanalAn(a, k));
     for (const pl of zusaetzlich) kanalAusVerkehr.push(`${a.slug || a.id}/${pl}`);
     for (const pl of liste) paare.push({ a, pl, studio: studioVon(a) });
   }
@@ -972,6 +975,53 @@ export function kanalZeile(b) {
   return `KANAL STUMM${wer ? ` (${wer})` : ""} — ${b.text}`;
 }
 
+// ---- Ausnahmen und Mailtexte ------------------------------------------------------
+// Was bewusst nicht ueberwacht wird, steht in jeder Antwort und jeder Mail. Sonst
+// wuerde eine Ausnahme, die laengst nicht mehr gilt, unbemerkt einen Kanal blind halten.
+// Ohne Ausnahmen sind beide Mails byte-gleich mit dem Stand vor dem Mandantenumbau.
+export function ausgenommenListe(org) {
+  const liste = (x) => (Array.isArray(x) ? x : []);
+  return [...liste(org?.nichtUeberwachen), ...liste(org?.nichtUeberwachenKanal)];
+}
+
+export function ausgenommenFeld(org) {
+  const l = ausgenommenListe(org);
+  return l.length ? { ausgenommen: l } : {};
+}
+
+function ausgenommenZeilen(org) {
+  const l = ausgenommenListe(org);
+  return l.length ? [`Nicht überwacht: ${l.join(", ")}`, ""] : [];
+}
+
+export function problemMailText({ problems, schritte, jetztIso, org }) {
+  return [
+    "Der Watchdog hat ein Problem erkannt:",
+    "",
+    ...problems.map((p) => "• " + p),
+    "",
+    "Was zu tun ist:",
+    ...schritte,
+    "",
+    ...ausgenommenZeilen(org),
+    `Zeit: ${jetztIso}`,
+    "(Gemeldet wird erst, wenn ein Problem zweimal hintereinander auftaucht — diese",
+    "Meldung stand also mindestens 5 Minuten an. Wiederholung frühestens in 2h.)",
+  ].join("\n");
+}
+
+export function entwarnungMailText({ ingestion, replyGap, jetztIso, org }) {
+  return [
+    "Entwarnung — die Automation läuft wieder normal.",
+    "",
+    `Letzter Eingang: ${ingestion?.lastInbound || "?"}`,
+    `Offene KI-Chats: ${replyGap?.stuckCount ?? 0}`,
+    "",
+    ...ausgenommenZeilen(org),
+    `Zeit: ${jetztIso}`,
+  ].join("\n");
+}
+
 export default async function handler(req, res) {
   // Auth: Vercel-Cron sendet "Authorization: Bearer <CRON_SECRET>". Manuell: ?key=<CRON_SECRET>.
   const secret = process.env.CRON_SECRET;
@@ -1078,30 +1128,17 @@ export default async function handler(req, res) {
   let alerted = null;
   if (action === "problem") {
     const subject = "🚨 " + (org?.alarm?.betreffProblem || "Automation: PROBLEM");
-    const body = [
-      "Der Watchdog hat ein Problem erkannt:",
-      "",
-      ...problems.map((p) => "• " + p),
-      "",
-      "Was zu tun ist:",
-      ...naechsteSchritte({ zernio, ingestion, n8n, execErrors, replyGap, kanalWirkung }),
-      "",
-      `Zeit: ${new Date().toISOString()}`,
-      "(Gemeldet wird erst, wenn ein Problem zweimal hintereinander auftaucht — diese",
-      "Meldung stand also mindestens 5 Minuten an. Wiederholung frühestens in 2h.)",
-    ].join("\n");
+    const body = problemMailText({
+      problems,
+      schritte: naechsteSchritte({ zernio, ingestion, n8n, execErrors, replyGap, kanalWirkung }),
+      jetztIso: new Date().toISOString(),
+      org,
+    });
     const [email, tg] = await Promise.all([sendEmail(subject, body, org), sendTelegram(subject + "\n\n" + body, org)]);
     alerted = { problem: true, email, telegram: tg };
   } else if (action === "resolved") {
     const subject = "✅ " + (org?.alarm?.betreffOk || "Automation: wieder OK");
-    const body = [
-      "Entwarnung — die Automation läuft wieder normal.",
-      "",
-      `Letzter Eingang: ${ingestion.lastInbound || "?"}`,
-      `Offene KI-Chats: ${replyGap.stuckCount ?? 0}`,
-      "",
-      `Zeit: ${new Date().toISOString()}`,
-    ].join("\n");
+    const body = entwarnungMailText({ ingestion, replyGap, jetztIso: new Date().toISOString(), org });
     const [email, tg] = await Promise.all([sendEmail(subject, body, org), sendTelegram(subject + "\n\n" + body, org)]);
     alerted = { resolved: true, email, telegram: tg };
   } else if (notifyOff) {
@@ -1120,5 +1157,6 @@ export default async function handler(req, res) {
     fp,
     healthy: problems.length === 0,
     alerted,
+    ...ausgenommenFeld(org),
   });
 }

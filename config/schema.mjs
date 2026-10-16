@@ -95,6 +95,16 @@ export function pruefeOrganisation(org, index = 0) {
       if (typeof x !== 'string' || !/^[a-z0-9][a-z0-9_-]{0,62}$/.test(x))
         f.push(`${wo('nichtUeberwachen')}: "${x}" ist kein Slug`);
   }
+  // Einzelne Kanaele stilllegen: nur "slug/kanal" mit bekanntem Kanal.
+  if (org?.nichtUeberwachenKanal !== undefined) {
+    if (!Array.isArray(org.nichtUeberwachenKanal))
+      f.push(`${wo('nichtUeberwachenKanal')} muss eine Liste aus "slug/kanal" sein`);
+    else for (const x of org.nichtUeberwachenKanal) {
+      const [slug, kanal, rest] = typeof x === 'string' ? x.split('/') : [];
+      if (rest !== undefined || !/^[a-z0-9][a-z0-9_-]{0,62}$/.test(slug ?? '') || !KANAELE.includes(kanal))
+        f.push(`${wo('nichtUeberwachenKanal')}: "${x}" ist kein "slug/kanal" mit bekanntem Kanal`);
+    }
+  }
   // Nach Migration 0028 auf true: dann ist eine nicht lesbare Marke ein Problem.
   if (org?.markePflicht !== undefined && typeof org.markePflicht !== 'boolean')
     f.push(`${wo('markePflicht')} muss true oder false sein`);
