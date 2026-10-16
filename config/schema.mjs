@@ -87,6 +87,14 @@ export function pruefeOrganisation(org, index = 0) {
   // true/false: ein "ja" waere stillschweigend falsy und der Schalter wirkungslos.
   if (org?.kanaeleAusDb !== undefined && typeof org.kanaeleAusDb !== 'boolean')
     f.push(`${wo('kanaeleAusDb')} muss true oder false sein`);
+  // Vorfuehr-/Probe-Studios, die keine der Pruefungen erfassen soll. Nur Slugs.
+  if (org?.nichtUeberwachen !== undefined) {
+    if (!Array.isArray(org.nichtUeberwachen))
+      f.push(`${wo('nichtUeberwachen')} muss eine Liste von Slugs sein`);
+    else for (const x of org.nichtUeberwachen)
+      if (typeof x !== 'string' || !/^[a-z0-9][a-z0-9_-]{0,62}$/.test(x))
+        f.push(`${wo('nichtUeberwachen')}: "${x}" ist kein Slug`);
+  }
   // Nach Migration 0028 auf true: dann ist eine nicht lesbare Marke ein Problem.
   if (org?.markePflicht !== undefined && typeof org.markePflicht !== 'boolean')
     f.push(`${wo('markePflicht')} muss true oder false sein`);

@@ -29,7 +29,8 @@ Jetzt kommt alles aus `installationen.json`, validiert gegen `schema.mjs`.
 | `pruefungen` | ja | Auswahl aus `PRUEFUNGEN` |
 | `provider.webhookMatch` | fuer `provider_webhook` | organisationseigener Match |
 | `kanaele` | fuer `kanal_wirkung` | Liste aus `instagram`/`whatsapp`; wird NICHT geraten |
-| `kanaeleAusDb` | nein | `true`: nur Accounts mit `ki_global_on=true`; Kanaele je Account = aktive `account_channels`-Zeilen ∪ Kanaele aus `kanaele` mit Kundennachrichten in 7 Tagen; Marke/Standort im Alarmtext. Unbekannter Kanalwert und nicht lesbare Kanalquelle werden als `KANALQUELLE:`-Problem gemeldet. Ohne Schalter Verhalten wie vorher |
+| `kanaeleAusDb` | nein | `true`: Kanaele je Account = aktive `account_channels`-Zeilen ∪ Kanaele aus `kanaele`, auf denen je eine Kundennachricht einging (ohne Zeitgrenze); Ingestion prueft alle Accounts, Kanal-Wirkung nur `ki_global_on=true`; Marke/Standort im Alarmtext. Unbekannter Kanalwert und nicht lesbare Kanalquelle werden als `KANALQUELLE:`-Problem gemeldet. Ohne Schalter Verhalten wie vorher |
+| `nichtUeberwachen` | nein | Slug-Liste (Vorfuehr-/Probe-Studios), von Ingestion und Kanal-Wirkung ausgenommen. Default leer |
 | `markePflicht` | nein | `true`: scheitert der Embed `mandant:mandanten(marke)`, ist das ein Problem (`Marke nicht lesbar (HTTP x)`). Default und TF vorerst `false` |
 | `alarm.email` / `alarm.telegramChatIds` | mindestens eines | Empfaenger |
 | `alarm.betreffProblem` / `betreffOk` / `absender` | nein | sonst neutrale Vorgabe |
@@ -46,12 +47,15 @@ Jetzt kommt alles aus `installationen.json`, validiert gegen `schema.mjs`.
 - **`markePflicht` erst nach 0028.** Bis Migration 0028 live ist, scheitert der Embed
   auf `mandanten` (HTTP 400) und der Melder prueft ohne Marke weiter. Nach 0028 und dem
   Probe-GET des Embeds `markePflicht: true` setzen, dann ist eine fehlende Marke laut.
-- **Vor dem Schalter live:** pruefen, dass TF je Account aktive `account_channels`-Zeilen
-  fuer Instagram und WhatsApp hat. Fehlen sie, haelt nur der 7-Tage-Verkehr den Kanal in
-  der Ueberwachung (`kanalAusVerkehr` in der Antwort zeigt das an).
-- **ki_global_on:** Mit dem Schalter werden Accounts mit `ki_global_on=false` nicht
-  ueberwacht, auch ihre Ingestion nicht. Stellt ein Studio die KI global aus, sieht der
-  Watchdog es bis zum Wiedereinschalten nicht.
+- **PFLICHT vor dem Aktivieren des Schalters (nur lesend):** den Bestand pruefen:
+  1. alle `platform`-Werte aktiver Zeilen: `select distinct platform from account_channels where active`.
+     Jeder Wert ausser `instagram`/`whatsapp` (nach trim/klein) erzeugt bei jedem Lauf
+     „Kanal unbekannt“ und damit einen Daueralarm. Erst bereinigen, dann einschalten.
+  2. ob TF je Account aktive Zeilen fuer Instagram und WhatsApp hat. Fehlen sie, haelt
+     nur „je Verkehr gehabt“ den Kanal in der Ueberwachung (`kanalAusVerkehr` zeigt das).
+  3. welche Studios Vorfuehr-/Probe-Studios sind: deren Slug in `nichtUeberwachen`.
+- **ki_global_on:** Die Ingestion prueft alle Accounts (der Eingang haengt nicht an der
+  KI). Nur die Kanal-Wirkung laesst Accounts mit `ki_global_on=false` aus.
 
 ## Warum `kanal_wirkung` seit dem 17.09.2026 dabei ist
 

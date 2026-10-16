@@ -40,6 +40,7 @@
       ],
       "kanaeleAusDb": true,
       "markePflicht": false,
+      "nichtUeberwachen": [],
       "provider": {
         "art": "zernio",
         "webhookMatch": "tattoo-fashion-zernio-ingest"
