@@ -83,6 +83,10 @@ export function pruefeOrganisation(org, index = 0) {
     else for (const k of org.kanaele)
       if (!KANAELE.includes(k)) f.push(`${wo('kanaele')}: "${k}" ist kein bekannter Kanal`);
   }
+  // Schalter fuer Kanaele je Account aus account_channels (Task 8). Nur echtes
+  // true/false: ein "ja" waere stillschweigend falsy und der Schalter wirkungslos.
+  if (org?.kanaeleAusDb !== undefined && typeof org.kanaeleAusDb !== 'boolean')
+    f.push(`${wo('kanaeleAusDb')} muss true oder false sein`);
   if ((org?.pruefungen ?? []).includes('kanal_wirkung') && org?.kanaele === undefined)
     f.push(`${wo('kanaele')} fehlt, obwohl kanal_wirkung geprueft werden soll — sonst raet der Melder, welche Kanaele es gibt`);
 

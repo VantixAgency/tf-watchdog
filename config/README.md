@@ -29,6 +29,7 @@ Jetzt kommt alles aus `installationen.json`, validiert gegen `schema.mjs`.
 | `pruefungen` | ja | Auswahl aus `PRUEFUNGEN` |
 | `provider.webhookMatch` | fuer `provider_webhook` | organisationseigener Match |
 | `kanaele` | fuer `kanal_wirkung` | Liste aus `instagram`/`whatsapp`; wird NICHT geraten |
+| `kanaeleAusDb` | nein | `true`: Kanaele je Account aus `account_channels?active=eq.true`, Marke/Standort im Alarmtext. Account ohne aktive Zeile faellt auf `kanaele` zurueck. Ohne Schalter Verhalten wie vorher |
 | `alarm.email` / `alarm.telegramChatIds` | mindestens eines | Empfaenger |
 | `alarm.betreffProblem` / `betreffOk` / `absender` | nein | sonst neutrale Vorgabe |
 | `schwellen.*` | nein | innerhalb `GRENZEN`, sonst abgelehnt |
