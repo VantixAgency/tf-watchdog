@@ -51,7 +51,7 @@
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
-import { pruefeKonfiguration, mitVorgaben, BRAUCHT_N8N } from "../config/schema.mjs";
+import { pruefeKonfiguration, mitVorgaben, BRAUCHT_N8N, KANAELE } from "../config/schema.mjs";
 import { kanalWirkungVerdict, kanalQueries } from "./kanal-wirkung.mjs";
 
 const HIER = dirname(fileURLToPath(import.meta.url));
@@ -213,6 +213,70 @@ export function ingestionVerdict(lastMs, nowMs, opts = {}) {
   };
 }
 
+// ---- Accounts und ihre Kanaele (Task 8, Mandantenfaehigkeit) -------------------
+// Ohne `kanaeleAusDb` gilt fuer jeden Account dieselbe Kanalliste aus der
+// Konfiguration -- exakt wie vor dem Umbau, inklusive derselben Accounts-Abfrage.
+// Mit dem Schalter kommt die Liste je Account aus `account_channels?active=eq.true`:
+// ein reines Instagram-Studio hat dann keinen WhatsApp-Kanal, den der Melder
+// "vermissen" koennte. Marke (aus `mandanten` ueber `accounts.mandant_id`) und
+// Standortname wandern in die Alarmzeilen.
+//
+// Zwei Rueckfaelle, beide bewusst:
+//  - Embed auf `mandanten` scheitert (Beziehung aus 0028 noch nicht live, PGRST200):
+//    erneut ohne Embed. Sonst waere der Melder bis zur Migration blind.
+//  - Account ohne aktive Kanalzeile: Konfigurationsliste, damit kein Kanal still
+//    aus der Ueberwachung faellt. Der Account steht dann in `kanalQuelleKonfig`.
+async function ladeAccountsMitKanaelen(org, base, headers) {
+  const konfigListe = org?.kanaele?.length ? org.kanaele : ["instagram", "whatsapp"];
+  const holen = (pfad) => withTimeout((signal) => fetch(`${base}/rest/v1/${pfad}`, { signal, headers }), 10000);
+
+  if (org?.kanaeleAusDb !== true) {
+    const accRes = await holen("accounts?select=id,slug");
+    if (!accRes.ok) return { fehlerStatus: accRes.status };
+    const accounts = await accRes.json();
+    return { accounts, paare: (Array.isArray(accounts) ? accounts : []).flatMap((a) => konfigListe.map((pl) => ({ a, pl }))) };
+  }
+
+  let accRes = await holen("accounts?select=id,slug,display_name,mandant:mandanten(marke)");
+  let ohneMarke = false;
+  if (!accRes.ok) {
+    ohneMarke = true;
+    accRes = await holen("accounts?select=id,slug,display_name");
+  }
+  if (!accRes.ok) return { fehlerStatus: accRes.status };
+  const accounts = await accRes.json();
+
+  const kanRes = await holen("account_channels?select=account_id,platform&active=eq.true");
+  if (!kanRes.ok) return { fehlerStatus: kanRes.status, wo: "account_channels" };
+  const zeilen = await kanRes.json();
+  const jeAccount = new Map();
+  // Nur bekannte Kanalnamen: der Wert geht direkt in eine PostgREST-Abfrage.
+  for (const z of Array.isArray(zeilen) ? zeilen : []) {
+    if (!KANAELE.includes(z?.platform)) continue;
+    if (!jeAccount.has(z.account_id)) jeAccount.set(z.account_id, []);
+    const l = jeAccount.get(z.account_id);
+    if (!l.includes(z.platform)) l.push(z.platform);
+  }
+
+  const paare = [];
+  const kanalQuelleKonfig = [];
+  for (const a of Array.isArray(accounts) ? accounts : []) {
+    const ausDb = jeAccount.get(a.id);
+    const liste = ausDb?.length ? KANAELE.filter((k) => ausDb.includes(k)) : konfigListe;
+    if (!ausDb?.length) kanalQuelleKonfig.push(a.slug || a.id);
+    const studio = {
+      ...(a.mandant?.marke ? { marke: a.mandant.marke } : {}),
+      ...(a.display_name ? { displayName: a.display_name } : {}),
+    };
+    for (const pl of liste) paare.push({ a, pl, studio });
+  }
+  return {
+    accounts, paare,
+    ...(kanalQuelleKonfig.length ? { kanalQuelleKonfig } : {}),
+    ...(ohneMarke ? { hinweisMarke: "Marke nicht lesbar (Beziehung accounts→mandanten fehlt?), geprueft ohne Marke" } : {}),
+  };
+}
+
 export async function checkIngestion(org) {
   // G4: Datenbankzugang je Organisation. Ohne das laese der Melder einer Organisation
   // in der Datenbank einer anderen -- Cross-Tenant-Datenzugriff.
@@ -221,24 +285,20 @@ export async function checkIngestion(org) {
   if (!url || !key) return { skipped: true, reason: "SUPABASE_SERVICE_KEY nicht gesetzt" };
   const base = url.replace(/\/$/, "");
   const headers = { apikey: key, Authorization: `Bearer ${key}` };
-  const kanaeleListe = org?.kanaele?.length ? org.kanaele : ["instagram", "whatsapp"];
   try {
     // FIX 17.09.2026: je Studio UND Kanal, nicht global.
     // Vorher stand hier EINE Abfrage ohne jeden Filter: "wann kam irgendwo die letzte
     // eingehende Nachricht an?". Eine einzige Instagram-Nachricht aus Landshut hielt
     // den Melder gruen — WhatsApp Muenchen haette wochenlang tot sein koennen, ohne
     // dass diese Zahl sich bewegt. Genau das ist am 17.09. passiert.
-    const accRes = await withTimeout(
-      (signal) => fetch(`${base}/rest/v1/accounts?select=id,slug`, { signal, headers }), 10000);
-    if (!accRes.ok) return { skipped: false, ok: true, ungeprueft: true, note: `Accounts-Abfrage HTTP ${accRes.status}` };
-    const accounts = await accRes.json();
+    const geladen = await ladeAccountsMitKanaelen(org, base, headers);
+    if (geladen.fehlerStatus)
+      return { skipped: false, ok: true, ungeprueft: true, note: `${geladen.wo === "account_channels" ? "Kanal" : "Accounts"}-Abfrage HTTP ${geladen.fehlerStatus}` };
+    const { accounts, paare } = geladen;
     if (!Array.isArray(accounts) || accounts.length === 0)
       return { skipped: false, ok: false, reason: "keine Accounts in DB", tote: [], kanaele: [] };
 
-    const paare = [];
-    for (const a of accounts) for (const pl of kanaeleListe) paare.push({ a, pl });
-
-    const kanaele = await Promise.all(paare.map(async ({ a, pl }) => {
+    const kanaele = await Promise.all(paare.map(async ({ a, pl, studio }) => {
       const name = `${a.slug || a.id}/${pl}`;
       // Der Join steht in `select=`, sonst antwortet PostgREST mit HTTP 400 (siehe kanalQueries).
       const q = `${base}/rest/v1/messages?select=created_at,chats!inner(platform)` +
@@ -246,17 +306,23 @@ export async function checkIngestion(org) {
                 `&account_id=eq.${a.id}&chats.platform=eq.${pl}` +
                 `&order=created_at.desc&limit=1`;
       const res = await withTimeout((signal) => fetch(q, { signal, headers }), 10000);
-      if (!res.ok) return { kanal: name, ungeprueft: true, note: `HTTP ${res.status}` };
+      if (!res.ok) return { kanal: name, ...studio, ungeprueft: true, note: `HTTP ${res.status}` };
       const rows = await res.json();
       const last = rows?.[0]?.created_at ? new Date(rows[0].created_at) : null;
       // Ein Kanal, der noch nie etwas empfangen hat, ist nicht tot — er ist neu.
       // Ihn als Ausfall zu melden waere ein Dauerfehlalarm bis zur ersten Nachricht.
-      if (!last) return { kanal: name, nieEmpfangen: true };
+      if (!last) return { kanal: name, ...studio, nieEmpfangen: true };
       const v = ingestionVerdict(last.getTime(), Date.now(), { staleH: org?.schwellen?.ingestStaleStunden });
-      return { kanal: name, lastInbound: last.toISOString(), ...v };
+      return { kanal: name, ...studio, lastInbound: last.toISOString(), ...v };
     }));
 
     const tote = kanaele.filter((k) => k.dead);
+    // Fingerprint-Baustein <slug>/<kanal>:<befund> je totem Kanal -- nur mit
+    // kanaeleAusDb, damit der Abdruck ohne Schalter byte-gleich bleibt. Ohne ihn
+    // haette ein zweites totes Studio denselben Abdruck wie das erste, und die
+    // Entprellung wuerde seinen Alarm als Wiederholung schlucken.
+    const toteFp = org?.kanaeleAusDb === true && tote.length
+      ? tote.map((t) => `${t.kanal}:ingestion_tot`).sort().join(",") : null;
     // `dead`/`ageHours` bleiben als Gesamtbild erhalten, damit bestehende Auswertungen
     // und die Entwarnungsmail weiterlaufen.
     const juengste = kanaele.filter((k) => k.lastInbound)
@@ -271,6 +337,9 @@ export async function checkIngestion(org) {
       ageHours: juengste?.ageHours ?? null,
       staleThresholdH: kanaele.find((k) => k.staleThresholdH)?.staleThresholdH ?? null,
       reason: tote.length ? tote.map((t) => `${t.kanal}: ${t.reason}`).join("; ") : null,
+      ...(toteFp ? { toteFp } : {}),
+      ...(geladen.kanalQuelleKonfig ? { kanalQuelleKonfig: geladen.kanalQuelleKonfig } : {}),
+      ...(geladen.hinweisMarke ? { hinweisMarke: geladen.hinweisMarke } : {}),
     };
   } catch (e) {
     return { skipped: false, ok: true, ungeprueft: true, note: "Ingestion-Check fehlgeschlagen: " + String(e).slice(0, 100) };
@@ -475,8 +544,6 @@ export async function checkKanalWirkung(org) {
   const zaehlKopf = { ...headers, Prefer: "count=exact", Range: "0-0", "Range-Unit": "items" };
   const fensterMin = Number(org?.schwellen?.wirkungFensterMin ?? 180);
   const seitIso = new Date(Date.now() - fensterMin * 60000).toISOString();
-  const kanaeleListe = org?.kanaele?.length ? org.kanaele : ["instagram", "whatsapp"];
-
   const zaehle = async (pfad) => {
     const res = await withTimeout((signal) => fetch(`${base}/rest/v1/${pfad}`, { signal, headers: zaehlKopf }), 10000);
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
@@ -486,15 +553,13 @@ export async function checkKanalWirkung(org) {
   };
 
   try {
-    const accRes = await withTimeout(
-      (signal) => fetch(`${base}/rest/v1/accounts?select=id,slug`, { signal, headers }), 10000);
-    if (!accRes.ok) return { skipped: false, ok: true, ungeprueft: true, note: `Accounts-Abfrage HTTP ${accRes.status}` };
-    const accounts = await accRes.json();
+    const geladen = await ladeAccountsMitKanaelen(org, base, headers);
+    if (geladen.fehlerStatus)
+      return { skipped: false, ok: true, ungeprueft: true, note: `${geladen.wo === "account_channels" ? "Kanal" : "Accounts"}-Abfrage HTTP ${geladen.fehlerStatus}` };
+    const { accounts, paare } = geladen;
     if (!Array.isArray(accounts) || accounts.length === 0)
       return { skipped: false, ok: false, note: "keine Accounts in der Datenbank gefunden" };
-
-    const paare = [];
-    for (const a of accounts) for (const pl of kanaeleListe) paare.push({ a, pl });
+    const studioJeName = new Map(paare.map(({ a, pl, studio }) => [`${a.slug || a.id}/${pl}`, studio || {}]));
 
     const kanaele = await Promise.all(paare.map(async ({ a, pl }) => {
       const q = kanalQueries({ accountId: a.id, platform: pl, seitIso });
@@ -524,7 +589,13 @@ export async function checkKanalWirkung(org) {
       mindestEingang: org?.schwellen?.wirkungMindestEingang,
       pausenAnteilProzent: org?.schwellen?.wirkungPausenAnteil,
     });
-    return { skipped: false, fensterMin, seit: seitIso, ...verdict };
+    // Marke/Standort an die Befunde haengen (nur wenn bekannt, sonst unveraendert).
+    const befunde = verdict.befunde.map((b) => ({ ...b, ...studioJeName.get(b.kanal) }));
+    return {
+      skipped: false, fensterMin, seit: seitIso, ...verdict, befunde,
+      ...(geladen.kanalQuelleKonfig ? { kanalQuelleKonfig: geladen.kanalQuelleKonfig } : {}),
+      ...(geladen.hinweisMarke ? { hinweisMarke: geladen.hinweisMarke } : {}),
+    };
   } catch (e) {
     // Eine gescheiterte Abfrage darf nicht dauer-alarmieren, aber auch nicht als
     // "geprueft und gesund" durchgehen.
@@ -569,6 +640,9 @@ export function computeFingerprint({ ingestion, n8n, execErrors, replyGap, zerni
     // Ein Melder, der wegen eines abgelaufenen Schluessels nichts sieht, ist ein
     // eigener Zustand und keine Wiederholung des Problems, das er nicht sehen kann.
     `blind:${execErrors?.blind === true}`,
+    // Nur mit kanaeleAusDb gesetzt (siehe checkIngestion); sonst bleibt der Abdruck
+    // byte-gleich mit dem Stand vor dem Mandantenumbau.
+    ...(ingestion?.toteFp ? [`ingk:${ingestion.toteFp}`] : []),
   ].join("|");
 }
 
@@ -782,6 +856,25 @@ export async function checkV2Bereit(org, holen = fetch) {
            gesund: gesund?.body ?? null, betrieb: betrieb?.body ?? null };
 }
 
+// ---- Alarmzeilen ---------------------------------------------------------------
+// Ausgelagert, damit der Text testbar ist, ohne den ganzen Handler zu fahren.
+// Marke und Standortname stehen nur drin, wenn sie bekannt sind (kanaeleAusDb);
+// ohne sie ist die Zeile byte-gleich mit dem Stand vor dem Mandantenumbau.
+export function studioBezeichnung(x) {
+  const teile = [x?.marke, x?.displayName].filter((v) => typeof v === "string" && v.trim());
+  return teile.length ? teile.join(" · ") : null;
+}
+
+export function ingestionZeile(t) {
+  const wer = studioBezeichnung(t);
+  return `INGESTION TOT (${wer ? wer + ", " : ""}${t.kanal}): seit ${t.ageHours}h keine eingehende Kundennachricht (letzte ${t.lastInbound}) — auf diesem Kanal kommt nichts mehr an.`;
+}
+
+export function kanalZeile(b) {
+  const wer = studioBezeichnung(b);
+  return `KANAL STUMM${wer ? ` (${wer})` : ""} — ${b.text}`;
+}
+
 export default async function handler(req, res) {
   // Auth: Vercel-Cron sendet "Authorization: Bearer <CRON_SECRET>". Manuell: ?key=<CRON_SECRET>.
   const secret = process.env.CRON_SECRET;
@@ -834,11 +927,9 @@ export default async function handler(req, res) {
   for (const p of zernio.problems || []) problems.push(`ZERNIO: ${p}`);
   // Der wichtigste Melder zuerst nach Zernio: arbeitet der Kanal, oder nimmt er nur an?
   // Das ist die Frage, die am 17.09.2026 niemand gestellt hat.
-  for (const b of kanalWirkung.befunde || []) problems.push(`KANAL STUMM — ${b.text}`);
+  for (const b of kanalWirkung.befunde || []) problems.push(kanalZeile(b));
   // Dann die Stille — der gefährlichste, weil komplett lautlose Ausfall. Je Kanal.
-  for (const t of ingestion.tote || []) {
-    problems.push(`INGESTION TOT (${t.kanal}): seit ${t.ageHours}h keine eingehende Kundennachricht (letzte ${t.lastInbound}) — auf diesem Kanal kommt nichts mehr an.`);
-  }
+  for (const t of ingestion.tote || []) problems.push(ingestionZeile(t));
   if (ingestion.reason === "keine Accounts in DB") {
     problems.push("INGESTION: keine Accounts in der Datenbank gefunden — Pipeline oder Zugang prüfen.");
   }
