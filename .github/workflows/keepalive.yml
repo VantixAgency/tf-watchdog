@@ -1,0 +1,51 @@
+name: TF Watchdog Keepalive
+
+# Gegen die 60-Tage-Regel: GitHub schaltet Schedules oeffentlicher Repos ab,
+# wenn im Repo 60 Tage nichts passiert (Masterplan 16.10.2026, W4).
+# (a) Workflows ausdruecklich aktivieren, (b) leerer Commit auf main.
+# Ob (b) als "repository activity" zaehlt, ist nicht dokumentiert, darum beides.
+# Wird trotzdem etwas abgeschaltet, meldet es der Totmannschalter.
+
+on:
+  schedule:
+    - cron: "17 6 1 * *"
+  workflow_dispatch: {}
+
+permissions:
+  actions: write
+  contents: write # nur dieser Workflow schreibt
+
+concurrency:
+  group: tf-watchdog-keepalive
+  cancel-in-progress: false
+
+jobs:
+  wachhalten:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+      - name: Workflows aktiviert halten
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          fehler=0
+          for w in watchdog.yml heiler.yml keepalive.yml; do  # auch sich selbst (Muster keepalive-workflow v2)
+            gh api -X PUT "repos/${GITHUB_REPOSITORY}/actions/workflows/${w}/enable" \
+              || { echo "::warning::enable ${w} fehlgeschlagen"; fehler=1; }
+          done
+          # Erst alle versuchen, dann rot werden: ein roter Lauf erzeugt eine GitHub-Mail.
+          echo "fehler=${fehler}" >> "$GITHUB_ENV"
+      - name: Leerer Commit auf main
+        run: |
+          git config user.name "tf-watchdog-keepalive"
+          git config user.email "keepalive@users.noreply.github.com"
+          git commit --allow-empty -m "keepalive $(date -u +%Y-%m) [skip ci]"
+          git push origin HEAD:main
+      - name: Rot, falls ein enable gescheitert ist
+        if: env.fehler == '1'
+        run: |
+          echo "::error::Mindestens ein Workflow konnte nicht aktiviert werden"
+          exit 1

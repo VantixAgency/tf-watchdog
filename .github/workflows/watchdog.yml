@@ -1,78 +1,68 @@
 name: TF Watchdog 5-min ping
 
-# Echter 5-Minuten-Takt trotz GitHub-Schedule-Drosselung: der Job pingt in einer
-# Schleife alle 5 Min (~5h40m lang) und triggert sich am Ende selbst neu
-# (Self-Chain). Der 6h-Schedule ist nur Sicherheits-Neustart, falls die Kette je
-# abreißt. Läuft extern auf GitHub (nicht auf dem überwachten n8n-Server).
-# Kostenlos, weil das Repo öffentlich ist (unbegrenzte Actions-Minuten).
+# Echter 5-Minuten-Takt als selbst verlaengernde Kette (Masterplan 16.10.2026, Paket W).
+#
+# Jedes Glied pingt ~5h40m alle 5 Min (scripts/kette.sh) und startet am Ende das
+# naechste per Dispatch (scripts/weiter.sh) — mit dem Entprellzustand als Input,
+# damit ein laufender Alarm nicht neu gemeldet und eine Entwarnung nicht
+# verschluckt wird.
+#
+# KEIN schedule hier, absichtlich: bei `concurrency` verdraengt ein neuer Lauf
+# einen schon wartenden. Ein Schedule-Lauf koennte so das Folgeglied MIT Zustand
+# ersetzen. Den Neustart nach einem Riss macht heiler.yml (eigene Gruppe), das
+# Melden eines Risses der Totmannschalter (healthchecks.io, Secret HC_UUID).
+#
+# Befund 16.10.: Bis dahin hat sich die Kette NIE selbst verlaengert —
+# `gh workflow run` lief ohne -R und ohne Checkout ("not a git repository"),
+# `|| true` hat es verschluckt. 32 Luecken > 6 min in 1038 h, groesste 231 min.
+#
+# KETTE ANHALTEN: Ein Abbruch in der Oberflaeche reicht NICHT — "Kette fortsetzen"
+# laeuft mit always() und startet das naechste Glied. Anhalten nur mit
+#   gh workflow disable watchdog.yml -R VantixAgency/tf-watchdog
+#   gh workflow disable heiler.yml   -R VantixAgency/tf-watchdog
+# Wieder an: beide `enable`, dann `gh workflow run watchdog.yml -R VantixAgency/tf-watchdog`.
 
 on:
-  workflow_dispatch: {}
-  schedule:
-    # Stuendlich statt alle 6 Stunden (Fix 17.09.2026).
-    # Der 6h-Takt war als Sicherheitsnetz gedacht, falls die Self-Chain abreisst.
-    # Genau das ist passiert: Der Lauf vom 17.09. endete um 09:32 UTC, der
-    # Self-Re-Dispatch griff nicht, und der naechste Schedule waere erst um 12:00
-    # gekommen — zweieinhalb Stunden voellig ohne Ueberwachung, mitten im
-    # Zeitfenster des WhatsApp-Ausfalls, ueber den Andy sich gemeldet hat.
-    # Ein Sicherheitsnetz mit 6 Stunden Maschenweite ist keines.
-    # Die concurrency-group unten macht den engeren Takt gefahrlos: Laeuft schon
-    # ein Job, wartet hoechstens einer, alle weiteren fallen weg. Es gibt also nie
-    # doppelte Pings — aber sobald die Kette reisst, springt sie binnen einer
-    # Stunde von selbst wieder an.
-    - cron: "0 * * * *"
+  workflow_dispatch:
+    inputs:
+      zustand:
+        description: "Entprellzustand je Organisation (JSON), vom vorigen Glied"
+        required: false
+        default: "{}"
 
 permissions:
-  actions: write # für Self-Re-Dispatch via gh
+  actions: write # Dispatch des Folgeglieds und run list
+  contents: read
 
 concurrency:
   group: tf-watchdog-chain
-  cancel-in-progress: false # nie den laufenden Ping-Job abbrechen; max. 1 pending
+  cancel-in-progress: false # nie das laufende Glied abbrechen; max. 1 wartendes
+
+env:
+  ORGS: tattoo-fashion # Staging bewusst nicht im Takt (Fehlkonfiguration, siehe Masterplan W2)
 
 jobs:
   ping:
     runs-on: ubuntu-latest
-    timeout-minutes: 350 # ~5h50m, dann übernimmt das nächste Kettenglied
+    timeout-minutes: 355
     steps:
-      - name: Alle 5 Minuten den Watchdog anstoßen (mit Alarm-Entprellung)
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+      - name: Alle 5 Minuten den Watchdog anstossen
+        # Schritt-Timeout statt nur Job-Timeout: so laeuft "Kette fortsetzen" immer
+        # noch innerhalb des Job-Limits (Review H27). 20400 s Schleife = 340 min.
+        timeout-minutes: 344
         env:
           KEY: ${{ secrets.WATCHDOG_KEY }}
-        run: |
-          set +e
-          BASE="https://tf-watchdog.vercel.app/api/check"
-          END=$(( $(date +%s) + 20400 ))   # ~5h40m aktiv pingen
-          # Zustandsgedächtnis: verhindert die 10-Mail-Flut. Der Endpoint mailt nur,
-          # wenn sich das Problem ÄNDERT, alle 2h erneut (Erinnerung), oder bei Entwarnung.
-          prev="OK"        # zuletzt gesehener Fingerprint (Startannahme: gesund)
-          alerted_fp="OK"  # Fingerprint, über den zuletzt WIRKLICH gemailt wurde
-          last_alert=0     # Unix-ts der letzten wirklich gesendeten Alarm-Mail
-          n=0
-          while [ "$(date +%s)" -lt "$END" ]; do
-            n=$((n+1))
-            now=$(date +%s)
-            sinceAlert=$(( now - last_alert ))
-            resp=$(curl -fsS -m 25 --get "$BASE" \
-              --data-urlencode "key=${KEY}" \
-              --data-urlencode "prev=${prev}" \
-              --data-urlencode "alertedFp=${alerted_fp}" \
-              --data-urlencode "sinceAlert=${sinceAlert}")
-            if [ $? -ne 0 ] || [ -z "$resp" ]; then
-              echo "$(date -u +%H:%M:%S) ping#$n -> CURL_FAIL (Vercel-Endpoint nicht erreichbar)"
-              sleep 300; continue
-            fi
-            fp=$(printf '%s' "$resp" | jq -r '.fp // "OK"')
-            didAlert=$(printf '%s' "$resp" | jq -r '(.alerted.problem // false)')
-            didResolve=$(printf '%s' "$resp" | jq -r '(.alerted.resolved // false)')
-            # Gedächtnis, worüber wirklich gemailt wurde. Ohne das käme entweder eine
-            # Mail-Flut oder eine Entwarnung für ein nie gemeldetes Problem.
-            if [ "$didAlert" = "true" ]; then last_alert=$now; alerted_fp="$fp"; fi
-            [ "$didResolve" = "true" ] && alerted_fp="OK"
-            echo "$(date -u +%H:%M:%S) ping#$n -> fp=${fp} alert=${didAlert} gemeldet=${alerted_fp}"
-            prev="$fp"
-            sleep 300
-          done
-      - name: Kette fortsetzen (Self-Re-Dispatch)
+          HC_UUID: ${{ secrets.HC_UUID }}
+          ZUSTAND: ${{ inputs.zustand }}
+          ZUSTAND_AUS: ${{ runner.temp }}/zustand.json
+        run: bash scripts/kette.sh
+      - name: Kette fortsetzen (Folgeglied starten und belegen)
         if: always()
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh workflow run watchdog.yml || true
+          ZUSTAND_DATEI: ${{ runner.temp }}/zustand.json
+        run: |
+          ZUSTAND=$(cat "$ZUSTAND_DATEI" 2>/dev/null || echo '{}') bash scripts/weiter.sh

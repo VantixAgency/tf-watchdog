@@ -1,0 +1,30 @@
+name: TF Watchdog Heiler
+
+# Startet die Watchdog-Kette neu, wenn kein Glied laeuft oder wartet
+# (Masterplan 16.10.2026, W3). Eigene concurrency-Gruppe: der Heiler kann die
+# Kette nie verdraengen. Ehrlich: GitHub liefert diesen Schedule oft nur alle
+# paar Stunden — er ist Rueckfall, nicht Taktgeber.
+
+on:
+  schedule:
+    - cron: "*/30 * * * *"
+  workflow_dispatch: {}
+
+permissions:
+  actions: write
+  contents: read
+
+concurrency:
+  group: tf-watchdog-heiler
+  cancel-in-progress: false
+
+jobs:
+  heilen:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Kette pruefen, nur bei Riss neu starten
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash scripts/heiler.sh
